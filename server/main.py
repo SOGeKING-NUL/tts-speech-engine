@@ -35,9 +35,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Services (created once, reused across connections) ───────────────────
+# ── Services ───────────────────────────────────────────────────────────────
 stt_service = SarvamSTT()
-tts_service = SarvamTTS()
 llm_service = GeminiLLM()
 
 # ── Sentence-boundary characters ────────────────────────────────────────
@@ -63,6 +62,7 @@ async def run_voice_pipeline(
     audio_data: bytes,
     sample_rate: int,
     conversation_history: list[dict],
+    tts_service: SarvamTTS,
 ) -> None:
     """
     Full STT → LLM → TTS cascade for one user turn.
@@ -183,6 +183,7 @@ async def voice_websocket(ws: WebSocket) -> None:
     recording_sample_rate = 48000
     is_recording = False
     pipeline_task: asyncio.Task | None = None
+    session_tts = SarvamTTS()
 
     try:
         while True:
@@ -193,11 +194,14 @@ async def voice_websocket(ws: WebSocket) -> None:
                 break
 
             # ── JSON control messages ────────────────────────────────
-            if "text" in message:
+            if   "text" in message:
                 data = json.loads(message["text"])
                 msg_type = data.get("type", "")
 
                 if msg_type == "audio.start":
+                    # KICKOFF TTS CONNECT
+                    asyncio.create_task(session_tts.connect())
+                    
                     audio_buffer = bytearray()
                     recording_sample_rate = data.get("sampleRate", 48000)
                     is_recording = True
@@ -219,7 +223,7 @@ async def voice_websocket(ws: WebSocket) -> None:
                         audio_bytes = bytes(audio_buffer)
                         pipeline_task = asyncio.create_task(
                             run_voice_pipeline(
-                                ws, audio_bytes, recording_sample_rate, conversation_history
+                                ws, audio_bytes, recording_sample_rate, conversation_history, session_tts
                             )
                         )
                     else:
@@ -255,6 +259,7 @@ async def voice_websocket(ws: WebSocket) -> None:
     finally:
         if pipeline_task and not pipeline_task.done():
             pipeline_task.cancel()
+        await session_tts.close()
         logger.info("Connection cleaned up")
 
 

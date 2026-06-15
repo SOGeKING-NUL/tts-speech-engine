@@ -70,6 +70,62 @@ class SarvamTTS:
         self.language = settings.SARVAM_TTS_LANGUAGE
         self.model = settings.SARVAM_TTS_MODEL
         self.sample_rate = settings.SARVAM_TTS_SAMPLE_RATE
+        self.ws: websockets.client.ClientConnection | None = None
+        self.lock = asyncio.Lock()
+
+    def _is_connected(self) -> bool:
+        if self.ws is None:
+            return False
+        if hasattr(self.ws, "state"):
+            return self.ws.state.name == "OPEN"
+        return not getattr(self.ws, "closed", True)
+
+    async def connect(self) -> None:
+        """Establish a persistent WebSocket connection to Sarvam."""
+        if self._is_connected():
+            return
+
+        async with self.lock:
+            # Double-check inside lock
+            if self._is_connected():
+                return
+
+            headers = {"api-subscription-key": self.api_key}
+            url = self._build_url()
+            self.ws = await websockets.connect(
+                url,
+                additional_headers=headers,
+                ping_interval=30,
+                ping_timeout=10,
+            )
+
+            # Send configuration (must be first message)
+            config = {
+                "type": "config",
+                "data": {
+                    "target_language_code": self.language,
+                    "speaker": self.voice,
+                    "output_audio_codec": "wav",
+                },
+            }
+            await self.ws.send(json.dumps(config))
+            logger.info(
+                "TTS WS persistently connected  voice=%s  model=%s  rate=%d",
+                self.voice, self.model, self.sample_rate,
+            )
+
+    async def close(self) -> None:
+        """Cleanly close the persistent WebSocket."""
+        async with self.lock:
+            if self.ws is not None:
+                if hasattr(self.ws, "state"):
+                    if self.ws.state.name != "CLOSED":
+                        await self.ws.close()
+                else:
+                    if not getattr(self.ws, "closed", True):
+                        await self.ws.close()
+                self.ws = None
+                logger.info("TTS WS closed cleanly")
 
     def _build_url(self) -> str:
         """Build the WebSocket URL with model and completion event as query params."""
@@ -99,32 +155,14 @@ class SarvamTTS:
         ------
         bytes   Raw PCM-16 audio data (no WAV header).
         """
-        headers = {"api-subscription-key": self.api_key}
-        url = self._build_url()
+        await self.connect()
 
         try:
-            async with websockets.connect(
-                url,
-                additional_headers=headers,
-                ping_interval=30,
-                ping_timeout=10,
-            ) as ws:
-                # ── 1. Send configuration (must be first message) ──────
-                config = {
-                    "type": "config",
-                    "data": {
-                        "target_language_code": self.language,
-                        "speaker": self.voice,
-                        "output_audio_codec": "wav",
-                    },
-                }
-                await ws.send(json.dumps(config))
-                logger.info(
-                    "TTS WS connected  voice=%s  model=%s  rate=%d  codec=wav",
-                    self.voice, self.model, self.sample_rate,
-                )
+            ws = self.ws
+            if not ws:
+                raise RuntimeError("TTS WebSocket is not connected.")
 
-                # ── 2. Background task: push text chunks ───────────────
+            # ── 2. Background task: push text chunks ───────────────
                 text_done = asyncio.Event()
 
                 async def _send_text() -> None:
