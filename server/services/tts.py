@@ -105,7 +105,7 @@ class SarvamTTS:
                 "data": {
                     "target_language_code": self.language,
                     "speaker": self.voice,
-                    "output_audio_codec": "wav",
+                    "output_audio_codec": "linear16",
                 },
             }
             await self.ws.send(json.dumps(config))
@@ -143,8 +143,8 @@ class SarvamTTS:
         Feed sentences from *text_chunks* into the persistent TTS WebSocket
         and yield raw PCM-16 audio as it arrives.
 
-        Audio arrives as base64-encoded WAV chunks inside JSON messages.
-        We decode base64, strip the WAV header, and yield raw PCM16 bytes.
+        Audio arrives as base64-encoded raw PCM16 chunks inside JSON messages.
+        We decode base64 and yield raw PCM16 bytes directly.
 
         Parameters
         ----------
@@ -218,8 +218,7 @@ class SarvamTTS:
                             b64_audio = audio_data
 
                         if b64_audio:
-                            wav_bytes = base64.b64decode(b64_audio)
-                            pcm_bytes = _strip_wav_header(wav_bytes)
+                            pcm_bytes = base64.b64decode(b64_audio)
                             if pcm_bytes:
                                 yield pcm_bytes
                         else:

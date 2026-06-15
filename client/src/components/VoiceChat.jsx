@@ -28,6 +28,7 @@ export default function VoiceChat() {
   const wsRef = useRef(null);
   const vadRef = useRef(null);
   const playerRef = useRef(new AudioPlayer());
+  const audioElRef = useRef(null); // Hidden <audio> element for AEC
   const currentResponseRef = useRef("");
   const llmDoneTextRef = useRef("");
   const messagesEndRef = useRef(null);
@@ -208,11 +209,19 @@ export default function VoiceChat() {
         const ws = wsRef.current;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
+        // Guard: if VAD fires twice rapidly, the second call sees the
+        // synchronously updated ref and bails out.
+        if (currentStatus === "recording" || currentStatus === "processing") return;
+
         // Barge-in: if AI is speaking, interrupt it first
         if (currentStatus === "speaking") {
           playerRef.current.stop();
           ws.send(JSON.stringify({ type: "interrupt" }));
         }
+
+        // Update ref synchronously BEFORE the async React setState,
+        // so a second rapid-fire callback will see "recording" and exit.
+        statusRef.current = "recording";
 
         // Tell server speech has started
         ws.send(JSON.stringify({ type: "speech.start" }));
@@ -253,6 +262,14 @@ export default function VoiceChat() {
       console.log("VAD started — listening for speech");
       // Resume AudioContext (needs user gesture — handled by the launch button in App.jsx)
       playerRef.current.resume();
+
+      // Bind the AudioPlayer's output stream to the hidden <audio> element.
+      // This is the AEC bridge: Chrome's echo cancellation properly tracks
+      // <audio> elements but NOT raw Web Audio API nodes.
+      const stream = playerRef.current.getOutputStream();
+      if (audioElRef.current && stream) {
+        audioElRef.current.srcObject = stream;
+      }
     }).catch((err) => {
       console.error("VAD start failed:", err);
       alert("Microphone permission is required for voice chat.");
@@ -331,6 +348,13 @@ export default function VoiceChat() {
       <footer className="controls">
         <StatusIndicator status={status} />
       </footer>
+
+      {/* Hidden <audio> element for AEC (Acoustic Echo Cancellation).
+          Chrome's AEC only cancels audio played through <audio>/<video> elements,
+          NOT raw Web Audio API nodes. The AudioPlayer routes all its output
+          through a MediaStreamAudioDestinationNode, and we bind that stream here. */}
+      {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+      <audio ref={audioElRef} autoPlay style={{ display: "none" }} />
     </div>
   );
 }

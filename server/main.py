@@ -220,6 +220,11 @@ async def voice_websocket(ws: WebSocket) -> None:
                             await pipeline_task
                         except (asyncio.CancelledError, Exception):
                             pass
+                        
+                        # Force close the TTS socket to drop any pending audio chunks
+                        # from the previous pipeline that was just cancelled.
+                        await session_tts.close()
+                        await session_tts.connect()
 
                     # Launch LLM → TTS pipeline
                     pipeline_task = asyncio.create_task(
@@ -236,6 +241,13 @@ async def voice_websocket(ws: WebSocket) -> None:
                             await pipeline_task
                         except (asyncio.CancelledError, Exception):
                             pass
+                        
+                        # The pipeline is dead, but the Sarvam server doesn't know that.
+                        # It will keep streaming audio for the old prompt. We MUST reset
+                        # the connection to physically severe the old audio stream.
+                        await session_tts.close()
+                        await session_tts.connect()
+                        
                     await _send_json(ws, {"type": "interrupted"})
 
                 elif msg_type == "clear_history":

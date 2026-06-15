@@ -34,14 +34,15 @@ export class VADManager {
    */
   async start() {
     this.vad = await MicVAD.new({
+      model: "v5",
       modelURL: "/silero_vad_v5.onnx",
       workletURL: "/vad.worklet.bundle.min.js",
       // ── Detection thresholds ───────────────────────────────────
-      positiveSpeechThreshold: 0.6,   // confidence to trigger speech start
-      negativeSpeechThreshold: 0.35,  // confidence to trigger speech end
-      minSpeechFrames: 3,             // require 3 frames (~96ms) of speech
-      preSpeechPadFrames: 5,          // capture 5 frames before speech detected (no clipped words)
-      redemptionFrames: 8,            // tolerate 8 frames (~256ms) of silence mid-sentence
+      positiveSpeechThreshold: 0.75,
+      negativeSpeechThreshold: 0.15,
+      minSpeechMs: 160,             // require 160ms of speech (filters clicks/pops)
+      preSpeechPadMs: 256,          // capture 256ms before speech detected (no clipped words)
+      redemptionMs: 3000,           // 3 seconds of patience for telephone-style 'thinking pauses'
 
       // ── Audio constraints ──────────────────────────────────────
       getStream: async () => {

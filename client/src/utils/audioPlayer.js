@@ -6,6 +6,12 @@
  *   2. Pre-buffering: waits for MIN_BUFFER_CHUNKS before starting
  *   3. Look-ahead scheduling: nextStartTime pattern for sample-accurate chaining
  *   4. Proper cleanup and memory management
+ *
+ * AEC (Acoustic Echo Cancellation) Support:
+ *   All audio is routed through a MediaStreamAudioDestinationNode and played
+ *   via a hidden <audio> element. Chrome's AEC properly tracks <audio> elements
+ *   but NOT raw AudioBufferSourceNodes. The consumer (VoiceChat) must call
+ *   getOutputStream() and attach it to an <audio> element's srcObject.
  */
 export class AudioPlayer {
   constructor(sampleRate = 22050) {
@@ -15,6 +21,10 @@ export class AudioPlayer {
     this.sources = [];
     this.isPlaying = false;
 
+    // The destination node that captures all audio as a MediaStream
+    // for AEC-compatible playback through an <audio> element.
+    this._streamDestination = null;
+
     // Pre-buffering: accumulate a few chunks before starting playback
     // to absorb network jitter and prevent gaps
     this.pendingBuffers = [];
@@ -22,20 +32,37 @@ export class AudioPlayer {
     this.playbackStarted = false;
   }
 
-  /** Create the AudioContext lazily (must happen after a user gesture). */
+  /** Create the AudioContext and AEC destination lazily (must happen after a user gesture). */
   _ensureContext() {
     if (!this.audioContext || this.audioContext.state === "closed") {
       this.audioContext = new AudioContext();
-      
-      // Start a continuous silent oscillator to keep the audio hardware awake.
-      // This prevents the OS/Bluetooth DAC from going to sleep and clipping the first 0.5s of audio.
-      this.silentOscillator = this.audioContext.createOscillator();
-      const gainNode = this.audioContext.createGain();
-      gainNode.gain.value = 0; // Pure silence
-      this.silentOscillator.connect(gainNode);
-      gainNode.connect(this.audioContext.destination);
-      this.silentOscillator.start();
+
+      // Create a MediaStream destination — this is the AEC bridge.
+      // All AudioBufferSourceNodes connect here instead of audioContext.destination.
+      // The resulting MediaStream is played through a hidden <audio> element,
+      // which Chrome's AEC can properly track and subtract from the microphone.
+      this._streamDestination = this.audioContext.createMediaStreamDestination();
+
+      // Start a continuous silent oscillator routed through the stream destination.
+      // This keeps the MediaStream "alive" and prevents the OS audio hardware
+      // from going to sleep and clipping the first 0.5s of audio.
+      this._silentOscillator = this.audioContext.createOscillator();
+      const silentGain = this.audioContext.createGain();
+      silentGain.gain.value = 0; // Pure silence
+      this._silentOscillator.connect(silentGain);
+      silentGain.connect(this._streamDestination);
+      this._silentOscillator.start();
     }
+  }
+
+  /**
+   * Get the output MediaStream for AEC-compatible playback.
+   * The consumer MUST attach this to a hidden <audio> element's srcObject.
+   * @returns {MediaStream | null}
+   */
+  getOutputStream() {
+    this._ensureContext();
+    return this._streamDestination?.stream ?? null;
   }
 
   /** Resume a suspended context (required by browsers after first gesture). */
@@ -53,6 +80,10 @@ export class AudioPlayer {
 
   /**
    * Convert PCM-16 ArrayBuffer to an AudioBuffer.
+   * Applies a micro-crossfade (fade-in/fade-out) at chunk boundaries
+   * to eliminate clicks caused by sample discontinuities between
+   * independently-encoded WAV chunks from the TTS service.
+   *
    * @param {ArrayBuffer} pcm16Buf  Raw signed-16-bit little-endian mono.
    * @returns {AudioBuffer}
    */
@@ -61,6 +92,15 @@ export class AudioPlayer {
     const float32 = new Float32Array(int16.length);
     for (let i = 0; i < int16.length; i++) {
       float32[i] = int16[i] / 32768.0;
+    }
+
+    // Micro-crossfade: 32 samples ≈ 1.3ms at 24kHz.
+    // Short enough to be inaudible, long enough to smooth discontinuities.
+    const fadeLen = Math.min(32, float32.length);
+    for (let i = 0; i < fadeLen; i++) {
+      const gain = i / fadeLen;
+      float32[i] *= gain;                           // fade in
+      float32[float32.length - 1 - i] *= gain;      // fade out
     }
 
     const buffer = this.audioContext.createBuffer(
@@ -75,12 +115,15 @@ export class AudioPlayer {
   /**
    * Schedule an AudioBuffer for playback at the correct time.
    * Uses the nextStartTime pattern for gapless chaining.
+   * Audio is routed to the _streamDestination (for AEC), NOT to audioContext.destination.
    * @param {AudioBuffer} audioBuffer
    */
   _scheduleBuffer(audioBuffer) {
     const source = this.audioContext.createBufferSource();
     source.buffer = audioBuffer;
-    source.connect(this.audioContext.destination);
+
+    // Route to the MediaStream destination (AEC bridge), not the raw speaker output.
+    source.connect(this._streamDestination);
     this.sources.push(source);
 
     // Schedule: if we've fallen behind, jump to now + look-ahead
