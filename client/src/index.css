@@ -1,39 +1,30 @@
 /* ═══════════════════════════════════════════════════════════════════════
-   Voice AI — Premium Dark Theme
+   Voice AI — Minimalist Dark Theme (Notion-like)
    ═══════════════════════════════════════════════════════════════════════ */
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap");
 
 /* ── Design Tokens ────────────────────────────────────────────────────── */
 :root {
-  --bg-primary: #07071a;
-  --bg-secondary: #0e0e2a;
-  --bg-surface: rgba(255, 255, 255, 0.025);
-  --bg-glass: rgba(255, 255, 255, 0.055);
-  --border-subtle: rgba(255, 255, 255, 0.08);
-  --border-glow: rgba(124, 58, 237, 0.25);
+  --bg-primary: #191919;
+  --bg-secondary: #202020;
+  --bg-surface: rgba(255, 255, 255, 0.05);
+  --bg-glass: rgba(30, 30, 30, 0.8);
+  --border-subtle: rgba(255, 255, 255, 0.09);
 
-  --text-primary: #f1f5f9;
-  --text-secondary: #94a3b8;
-  --text-muted: #64748b;
+  --text-primary: #EBEBEA;
+  --text-secondary: rgba(255, 255, 255, 0.65);
+  --text-muted: rgba(255, 255, 255, 0.4);
 
-  --accent-purple: #7c3aed;
-  --accent-purple-light: #a78bfa;
-  --accent-blue: #3b82f6;
-  --accent-cyan: #06b6d4;
-  --accent-gradient: linear-gradient(135deg, #7c3aed, #3b82f6, #06b6d4);
+  --accent-primary: #EBEBEA;
+  --accent-secondary: #5A5A5A;
+  
+  --success: #2EA043;
+  --error: #FF6A55;
 
-  --success: #22c55e;
-  --error: #ef4444;
-  --warning: #f59e0b;
-
-  --radius-sm: 8px;
-  --radius-md: 14px;
-  --radius-lg: 18px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
   --radius-full: 9999px;
-
-  --shadow-glow-purple: 0 0 24px rgba(124, 58, 237, 0.35);
-  --shadow-glow-red: 0 0 24px rgba(239, 68, 68, 0.35);
-  --shadow-glow-cyan: 0 0 24px rgba(6, 182, 212, 0.35);
 }
 
 /* ── Reset ─────────────────────────────────────────────────────────────── */
@@ -51,7 +42,7 @@ html, body {
 }
 
 body {
-  font-family: "Inter", system-ui, -apple-system, sans-serif;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   background: var(--bg-primary);
   color: var(--text-primary);
   -webkit-font-smoothing: antialiased;
@@ -70,11 +61,51 @@ body {
   display: flex;
   justify-content: center;
   align-items: stretch;
-  background:
-    radial-gradient(ellipse at 15% 50%, rgba(124, 58, 237, 0.07) 0%, transparent 55%),
-    radial-gradient(ellipse at 85% 15%, rgba(59, 130, 246, 0.05) 0%, transparent 55%),
-    radial-gradient(ellipse at 50% 90%, rgba(6, 182, 212, 0.04) 0%, transparent 55%),
-    var(--bg-primary);
+  background: var(--bg-primary);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Launch Screen
+   ═══════════════════════════════════════════════════════════════════════ */
+.launch-screen {
+  align-items: center;
+  justify-content: center;
+}
+
+.launch-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  animation: fadeIn 0.4s ease;
+}
+
+.launch-btn {
+  padding: 12px 24px;
+  font-size: 1rem;
+  font-weight: 500;
+  font-family: inherit;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.launch-btn:hover {
+  background: #2C2C2C;
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.launch-btn:active {
+  transform: scale(0.98);
+}
+
+.launch-hint {
+  margin-top: 16px;
+  font-size: 0.85rem;
+  color: var(--text-muted);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -285,7 +316,7 @@ body {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   Controls
+   Controls / Footer
    ═══════════════════════════════════════════════════════════════════════ */
 .controls {
   padding: 16px 28px 36px;
@@ -308,109 +339,155 @@ body {
   background: linear-gradient(90deg, transparent, var(--border-subtle), transparent);
 }
 
-.status-text {
+/* ═══════════════════════════════════════════════════════════════════════
+   Status Indicator (replaces MicButton)
+   ═══════════════════════════════════════════════════════════════════════ */
+.status-indicator {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.indicator-label {
   font-size: 0.8125rem;
   color: var(--text-secondary);
   font-weight: 500;
-  min-height: 20px;
-  transition: all 0.3s ease;
   letter-spacing: 0.01em;
+  transition: color 0.3s ease;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   Mic Button
-   ═══════════════════════════════════════════════════════════════════════ */
-.mic-button {
-  width: 74px;
-  height: 74px;
-  border-radius: var(--radius-full);
-  border: none;
-  cursor: pointer;
+/* ── The animated orb ───────────────────────────────────────────────── */
+.indicator-orb {
+  position: relative;
+  width: 56px;
+  height: 56px;
   display: flex;
   align-items: center;
   justify-content: center;
-  position: relative;
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  background: linear-gradient(135deg, var(--accent-purple), var(--accent-blue));
-  box-shadow: var(--shadow-glow-purple);
-  color: white;
 }
 
-.mic-button svg {
-  width: 28px;
-  height: 28px;
-  position: relative;
+.orb-core {
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-full);
+  background: var(--text-muted);
+  transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
   z-index: 2;
 }
 
-.mic-button:hover:not(:disabled) {
-  transform: scale(1.06);
-  box-shadow: 0 0 36px rgba(124, 58, 237, 0.45);
+.orb-ring {
+  position: absolute;
+  border-radius: var(--radius-full);
+  border: 2px solid transparent;
+  transition: all 0.4s ease;
+  opacity: 0;
 }
 
-.mic-button:active:not(:disabled) {
-  transform: scale(0.94);
+.ring-1 { inset: 6px; }
+.ring-2 { inset: -2px; }
+.ring-3 { inset: -10px; }
+
+/* ── Idle ──────────────────────────────────────────────────────────── */
+.status-indicator.idle .orb-core {
+  background: var(--text-muted);
+  animation: idlePulse 2.5s ease-in-out infinite;
 }
 
-.mic-button:disabled {
-  opacity: 0.35;
-  cursor: not-allowed;
-  box-shadow: none;
+/* ── Listening ────────────────────────────────────────────────────── */
+.status-indicator.listening .orb-core {
+  background: var(--accent-blue);
+  box-shadow: 0 0 16px rgba(59, 130, 246, 0.4);
+  animation: listenPulse 2s ease-in-out infinite;
 }
 
-/* ── Recording state ─────────────────────────────────────────── */
-.mic-button.recording {
+.status-indicator.listening .ring-1 {
+  opacity: 0.5;
+  border-color: rgba(59, 130, 246, 0.3);
+  animation: ringPulse 2s ease-in-out infinite;
+}
+
+.status-indicator.listening .ring-2 {
+  opacity: 0.25;
+  border-color: rgba(59, 130, 246, 0.15);
+  animation: ringPulse 2s ease-in-out infinite 0.4s;
+}
+
+.status-indicator.listening .indicator-label {
+  color: var(--accent-blue);
+}
+
+/* ── Recording (user is speaking) ─────────────────────────────────── */
+.status-indicator.recording .orb-core {
   background: linear-gradient(135deg, #ef4444, #f97316);
-  box-shadow: var(--shadow-glow-red);
-  animation: pulse 1.6s ease-in-out infinite;
+  box-shadow: 0 0 20px rgba(239, 68, 68, 0.5);
+  animation: recordPulse 0.8s ease-in-out infinite;
+  width: 24px;
+  height: 24px;
 }
 
-.mic-button.recording::before,
-.mic-button.recording::after {
-  content: "";
-  position: absolute;
-  border-radius: var(--radius-full);
-  border: 2px solid rgba(239, 68, 68, 0.4);
-  animation: ripple 1.6s ease-out infinite;
+.status-indicator.recording .ring-1 {
+  opacity: 0.7;
+  border-color: rgba(239, 68, 68, 0.4);
+  animation: ripple 1.4s ease-out infinite;
 }
 
-.mic-button.recording::before { inset: -10px; animation-delay: 0s; }
-.mic-button.recording::after { inset: -22px; animation-delay: 0.55s; }
+.status-indicator.recording .ring-2 {
+  opacity: 0.4;
+  border-color: rgba(239, 68, 68, 0.25);
+  animation: ripple 1.4s ease-out infinite 0.3s;
+}
 
-/* ── Processing state ────────────────────────────────────────── */
-.mic-button.processing {
+.status-indicator.recording .ring-3 {
+  opacity: 0.2;
+  border-color: rgba(239, 68, 68, 0.15);
+  animation: ripple 1.4s ease-out infinite 0.6s;
+}
+
+.status-indicator.recording .indicator-label {
+  color: #ef4444;
+}
+
+/* ── Processing ───────────────────────────────────────────────────── */
+.status-indicator.processing .orb-core {
   background: linear-gradient(135deg, var(--accent-blue), var(--accent-cyan));
-  box-shadow: 0 0 20px rgba(59, 130, 246, 0.3);
+  box-shadow: 0 0 16px rgba(59, 130, 246, 0.35);
+  animation: processSpin 1.2s linear infinite;
 }
 
-.mic-button.processing::before {
-  content: "";
-  position: absolute;
-  inset: -5px;
-  border-radius: var(--radius-full);
-  border: 2.5px solid transparent;
-  border-top-color: rgba(255, 255, 255, 0.65);
-  border-right-color: rgba(255, 255, 255, 0.2);
-  animation: spin 0.9s linear infinite;
+.status-indicator.processing .ring-1 {
+  opacity: 0.6;
+  border-color: transparent;
+  border-top-color: rgba(59, 130, 246, 0.6);
+  border-right-color: rgba(6, 182, 212, 0.3);
+  animation: spin 1s linear infinite;
 }
 
-.mic-button.processing svg {
-  animation: spin 2.5s linear infinite;
+.status-indicator.processing .indicator-label {
+  color: var(--accent-cyan);
 }
 
-/* ── Speaking state ──────────────────────────────────────────── */
-.mic-button.speaking {
+/* ── Speaking ─────────────────────────────────────────────────────── */
+.status-indicator.speaking .orb-core {
   background: linear-gradient(135deg, var(--accent-cyan), var(--success));
-  box-shadow: var(--shadow-glow-cyan);
+  box-shadow: 0 0 20px rgba(6, 182, 212, 0.4);
+  animation: speakPulse 1s ease-in-out infinite;
 }
 
-.mic-button.speaking::before {
-  content: "";
-  position: absolute;
-  inset: -7px;
-  border-radius: var(--radius-full);
-  border: 2px solid rgba(6, 182, 212, 0.3);
-  animation: pulse 1.2s ease-in-out infinite;
+.status-indicator.speaking .ring-1 {
+  opacity: 0.5;
+  border-color: rgba(6, 182, 212, 0.3);
+  animation: speakRing 1s ease-in-out infinite;
+}
+
+.status-indicator.speaking .ring-2 {
+  opacity: 0.25;
+  border-color: rgba(34, 197, 94, 0.2);
+  animation: speakRing 1s ease-in-out infinite 0.2s;
+}
+
+.status-indicator.speaking .indicator-label {
+  color: var(--accent-cyan);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -441,9 +518,24 @@ body {
   50% { opacity: 0; }
 }
 
-@keyframes pulse {
+@keyframes idlePulse {
+  0%, 100% { opacity: 0.5; transform: scale(1); }
+  50%      { opacity: 0.7; transform: scale(1.05); }
+}
+
+@keyframes listenPulse {
   0%, 100% { transform: scale(1); }
-  50%      { transform: scale(1.045); }
+  50%      { transform: scale(1.15); }
+}
+
+@keyframes ringPulse {
+  0%, 100% { transform: scale(1); opacity: 0.5; }
+  50%      { transform: scale(1.08); opacity: 0.3; }
+}
+
+@keyframes recordPulse {
+  0%, 100% { transform: scale(1); }
+  50%      { transform: scale(1.2); }
 }
 
 @keyframes ripple {
@@ -451,8 +543,24 @@ body {
   100% { transform: scale(1.6); opacity: 0; }
 }
 
+@keyframes processSpin {
+  0%   { transform: rotate(0deg) scale(1); }
+  50%  { transform: rotate(180deg) scale(0.9); }
+  100% { transform: rotate(360deg) scale(1); }
+}
+
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+@keyframes speakPulse {
+  0%, 100% { transform: scale(1); }
+  50%      { transform: scale(1.1); }
+}
+
+@keyframes speakRing {
+  0%, 100% { transform: scale(1); opacity: 0.5; }
+  50%      { transform: scale(1.12); opacity: 0.2; }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -464,8 +572,6 @@ body {
   .messages { padding: 18px; }
   .controls { padding: 12px 18px 28px; }
   .title { font-size: 1.5rem; }
-  .mic-button { width: 66px; height: 66px; }
-  .mic-button svg { width: 24px; height: 24px; }
   .message { max-width: 90%; padding: 12px 16px; }
 }
 

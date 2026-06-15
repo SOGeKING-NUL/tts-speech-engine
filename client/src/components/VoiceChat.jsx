@@ -1,31 +1,37 @@
 /**
- * VoiceChat — main component that wires together:
- *   WebSocket  ↔  AudioRecorder  ↔  AudioPlayer  ↔  UI
+ * VoiceChat — Always-on voice conversation component.
+ *
+ * Wires together:
+ *   VADManager (Silero)  →  WebSocket  →  AudioPlayer  →  UI
+ *
+ * No buttons needed — speech is detected automatically via client-side
+ * Voice Activity Detection. Supports barge-in interruption.
  */
 import { useState, useEffect, useRef, useCallback } from "react";
 import ChatMessage from "./ChatMessage";
-import MicButton from "./MicButton";
-import { AudioRecorder } from "../utils/audioRecorder";
+import StatusIndicator from "./StatusIndicator";
+import { VADManager } from "../utils/vadManager";
 import { AudioPlayer } from "../utils/audioPlayer";
 
 const WS_URL =
-  import.meta.env.VITE_WS_URL || "ws://localhost:8000/ws/voice";
+  import.meta.env.VITE_WS_URL ||
+  `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws/voice`;
 
 export default function VoiceChat() {
   // ── State ──────────────────────────────────────────────────────────
   const [messages, setMessages] = useState([]);
-  const [status, setStatus] = useState("ready"); // ready|recording|processing|speaking
+  const [status, setStatus] = useState("idle"); // idle|listening|recording|processing|speaking
   const [currentResponse, setCurrentResponse] = useState("");
   const [isConnected, setIsConnected] = useState(false);
 
   // ── Refs (survive re-renders, avoid stale closures) ────────────────
   const wsRef = useRef(null);
-  const recorderRef = useRef(null);
+  const vadRef = useRef(null);
   const playerRef = useRef(new AudioPlayer());
   const currentResponseRef = useRef("");
   const llmDoneTextRef = useRef("");
   const messagesEndRef = useRef(null);
-  const statusRef = useRef("ready");
+  const statusRef = useRef("idle");
 
   // Keep statusRef in sync
   useEffect(() => {
@@ -36,6 +42,12 @@ export default function VoiceChat() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, currentResponse]);
+
+  // ── Resume VAD listening (called after TTS finishes or interrupt) ──
+  const resumeListening = useCallback(() => {
+    setStatus("listening");
+    vadRef.current?.resume();
+  }, []);
 
   // ── WebSocket message handler ──────────────────────────────────────
   const handleMessage = useCallback((data) => {
@@ -67,6 +79,8 @@ export default function VoiceChat() {
         if (data.sampleRate) {
           playerRef.current.setSampleRate(data.sampleRate);
         }
+        // Resume VAD so barge-in can be detected while AI speaks
+        vadRef.current?.resume();
         break;
 
       case "tts.done": {
@@ -81,12 +95,12 @@ export default function VoiceChat() {
         currentResponseRef.current = "";
         llmDoneTextRef.current = "";
 
-        // Wait for audio to finish playing before setting ready
+        // Wait for audio to finish playing, then resume listening
         const checkDone = () => {
           if (playerRef.current.isActive()) {
             setTimeout(checkDone, 200);
           } else {
-            setStatus("ready");
+            resumeListening();
           }
         };
         checkDone();
@@ -95,7 +109,6 @@ export default function VoiceChat() {
 
       case "error":
         console.error("Server error:", data.message);
-        // Save any partial response
         if (currentResponseRef.current) {
           setMessages((prev) => [
             ...prev,
@@ -105,7 +118,7 @@ export default function VoiceChat() {
         setCurrentResponse("");
         currentResponseRef.current = "";
         llmDoneTextRef.current = "";
-        setStatus("ready");
+        resumeListening();
         break;
 
       case "interrupted":
@@ -113,7 +126,8 @@ export default function VoiceChat() {
         setCurrentResponse("");
         currentResponseRef.current = "";
         llmDoneTextRef.current = "";
-        setStatus("ready");
+        // Don't resume listening here — the new speech that triggered
+        // the barge-in is still being captured by VAD
         break;
 
       case "history_cleared":
@@ -123,7 +137,7 @@ export default function VoiceChat() {
       default:
         break;
     }
-  }, []);
+  }, [resumeListening]);
 
   // ── WebSocket connection (with auto-reconnect) ─────────────────────
   useEffect(() => {
@@ -139,11 +153,13 @@ export default function VoiceChat() {
       ws.onopen = () => {
         console.log("WS connected");
         setIsConnected(true);
+        setStatus("listening");
       };
 
       ws.onclose = () => {
         console.log("WS disconnected");
         setIsConnected(false);
+        setStatus("idle");
         if (!closed) reconnectTimer = setTimeout(connect, 3000);
       };
 
@@ -181,49 +197,71 @@ export default function VoiceChat() {
     };
   }, [handleMessage]);
 
-  // ── Mic button handler ─────────────────────────────────────────────
-  const handleMicClick = async () => {
-    const s = statusRef.current;
+  // ── VAD lifecycle ──────────────────────────────────────────────────
+  useEffect(() => {
+    if (!isConnected) return;
 
-    if (s === "recording") {
-      // ── Stop recording → send audio ──────────────────────────────
-      const result = recorderRef.current?.stop();
-      recorderRef.current = null;
-
-      if (result?.data?.byteLength > 0) {
-        setStatus("processing");
+    const vad = new VADManager({
+      onSpeechStart: () => {
+        const currentStatus = statusRef.current;
         const ws = wsRef.current;
-        if (ws?.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({
-              type: "audio.start",
-              sampleRate: result.sampleRate,
-            }),
-          );
-          ws.send(result.data);
-          ws.send(JSON.stringify({ type: "audio.end" }));
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        // Barge-in: if AI is speaking, interrupt it first
+        if (currentStatus === "speaking") {
+          playerRef.current.stop();
+          ws.send(JSON.stringify({ type: "interrupt" }));
         }
-      } else {
-        setStatus("ready");
-      }
-    } else if (s === "ready") {
-      // ── Start recording ──────────────────────────────────────────
-      try {
-        const recorder = new AudioRecorder();
-        await recorder.start();
-        recorderRef.current = recorder;
+
+        // Tell server speech has started
+        ws.send(JSON.stringify({ type: "speech.start" }));
         setStatus("recording");
-        await playerRef.current.resume(); // needs user gesture
-      } catch (err) {
-        console.error("Mic access failed:", err);
-        alert("Microphone permission is required.");
-      }
-    } else if (s === "speaking") {
-      // ── Interrupt ────────────────────────────────────────────────
-      playerRef.current.stop();
-      wsRef.current?.send(JSON.stringify({ type: "interrupt" }));
-    }
-  };
+      },
+
+      onSpeechEnd: (audio) => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        // Convert Float32 (16kHz mono from VAD) → PCM-16 bytes
+        const pcm16 = new Int16Array(audio.length);
+        for (let i = 0; i < audio.length; i++) {
+          const s = Math.max(-1, Math.min(1, audio[i]));
+          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+
+        // Send the complete utterance audio as binary
+        ws.send(pcm16.buffer);
+
+        // Tell server speech has ended
+        ws.send(JSON.stringify({ type: "speech.end" }));
+        setStatus("processing");
+
+        // Pause VAD while server processes (re-enabled on tts.start or tts.done)
+        vadRef.current?.pause();
+      },
+
+      onFrameProcessed: (_probs) => {
+        // Could be used for visual volume indicators in the future
+      },
+    });
+
+    vadRef.current = vad;
+
+    // Start VAD (requests mic permission)
+    vad.start().then(() => {
+      console.log("VAD started — listening for speech");
+      // Resume AudioContext (needs user gesture — handled by the launch button in App.jsx)
+      playerRef.current.resume();
+    }).catch((err) => {
+      console.error("VAD start failed:", err);
+      alert("Microphone permission is required for voice chat.");
+    });
+
+    return () => {
+      vad.destroy();
+      vadRef.current = null;
+    };
+  }, [isConnected]);
 
   // ── Clear history handler ──────────────────────────────────────────
   const handleClearHistory = () => {
@@ -234,13 +272,6 @@ export default function VoiceChat() {
   };
 
   // ── Render ─────────────────────────────────────────────────────────
-  const statusText = {
-    ready: "Tap to speak",
-    recording: "Listening…",
-    processing: "Thinking…",
-    speaking: "Speaking… tap to interrupt",
-  }[status];
-
   return (
     <div className="voice-chat">
       {/* ── Header ─────────────────────────────────────────────────── */}
@@ -277,7 +308,7 @@ export default function VoiceChat() {
         {messages.length === 0 && !currentResponse && (
           <div className="empty-state">
             <div className="empty-icon">🎙️</div>
-            <p className="empty-text">Tap the microphone to start a conversation</p>
+            <p className="empty-text">Just start speaking — I'm listening</p>
           </div>
         )}
 
@@ -295,14 +326,9 @@ export default function VoiceChat() {
         <div ref={messagesEndRef} />
       </main>
 
-      {/* ── Controls ───────────────────────────────────────────────── */}
+      {/* ── Status Indicator ─────────────────────────────────────────── */}
       <footer className="controls">
-        <div className="status-text">{statusText}</div>
-        <MicButton
-          status={status}
-          onClick={handleMicClick}
-          disabled={!isConnected || status === "processing"}
-        />
+        <StatusIndicator status={status} />
       </footer>
     </div>
   );

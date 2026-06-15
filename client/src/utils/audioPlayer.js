@@ -26,6 +26,15 @@ export class AudioPlayer {
   _ensureContext() {
     if (!this.audioContext || this.audioContext.state === "closed") {
       this.audioContext = new AudioContext();
+      
+      // Start a continuous silent oscillator to keep the audio hardware awake.
+      // This prevents the OS/Bluetooth DAC from going to sleep and clipping the first 0.5s of audio.
+      this.silentOscillator = this.audioContext.createOscillator();
+      const gainNode = this.audioContext.createGain();
+      gainNode.gain.value = 0; // Pure silence
+      this.silentOscillator.connect(gainNode);
+      gainNode.connect(this.audioContext.destination);
+      this.silentOscillator.start();
     }
   }
 
