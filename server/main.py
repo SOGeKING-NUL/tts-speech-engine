@@ -2,7 +2,7 @@
 TTS Speech Engine — FastAPI server.
 
 Single WebSocket endpoint ``/ws/voice`` orchestrates:
-    Client audio → STT → LLM (streaming) → TTS (streaming) → Client audio
+    Client audio (streamed via VAD) → STT (streaming) → LLM (streaming) → TTS (streaming) → Client audio
 """
 
 import asyncio
@@ -13,7 +13,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
-from services.stt import SarvamSTT
+from services.stt import SarvamStreamingSTT
 from services.tts import SarvamTTS
 from services.llm import GeminiLLM
 
@@ -25,7 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger("engine")
 
 # ── App & middleware ─────────────────────────────────────────────────────
-app = FastAPI(title="TTS Speech Engine", version="0.1.0")
+app = FastAPI(title="TTS Speech Engine", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,8 +35,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Services ───────────────────────────────────────────────────────────────
-stt_service = SarvamSTT()
+# ── Global services (stateless, shared across connections) ───────────────
 llm_service = GeminiLLM()
 
 # ── Sentence-boundary characters ────────────────────────────────────────
@@ -55,38 +54,22 @@ async def _send_json(ws: WebSocket, data: dict) -> None:
 
 
 # ═════════════════════════════════════════════════════════════════════════
-#  Voice pipeline
+#  Voice pipeline (LLM → TTS only — STT is handled before this)
 # ═════════════════════════════════════════════════════════════════════════
 async def run_voice_pipeline(
     ws: WebSocket,
-    audio_data: bytes,
-    sample_rate: int,
+    transcript: str,
     conversation_history: list[dict],
     tts_service: SarvamTTS,
 ) -> None:
     """
-    Full STT → LLM → TTS cascade for one user turn.
+    LLM → TTS cascade for one user turn.
 
-    The function is designed to be run via ``asyncio.create_task`` so the
-    WebSocket receive loop can still handle ``interrupt`` messages.
+    Receives a pre-computed transcript (from streaming STT) and runs it
+    through the LLM and TTS pipeline concurrently.
     """
 
-    # ── Phase 1: Speech-to-Text ──────────────────────────────────────────
-    await _send_json(ws, {"type": "processing", "stage": "stt"})
-
-    try:
-        transcript = await stt_service.transcribe(audio_data, sample_rate)
-    except Exception as exc:
-        await _send_json(ws, {"type": "error", "message": f"Speech recognition failed: {exc}"})
-        return
-
-    if not transcript or not transcript.strip():
-        await _send_json(ws, {"type": "error", "message": "Could not understand the audio. Please try again."})
-        return
-
-    await _send_json(ws, {"type": "stt.result", "text": transcript})
-
-    # ── Phase 2: LLM + TTS (concurrent) ─────────────────────────────────
+    # ── LLM + TTS (concurrent) ───────────────────────────────────────────
     await _send_json(ws, {"type": "processing", "stage": "llm"})
 
     sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -178,14 +161,23 @@ async def voice_websocket(ws: WebSocket) -> None:
     await ws.accept()
     logger.info("Client connected")
 
+    # ── Per-session state ────────────────────────────────────────────────
     conversation_history: list[dict] = []
-    audio_buffer = bytearray()
-    recording_sample_rate = 48000
-    is_recording = False
     pipeline_task: asyncio.Task | None = None
+    is_speaking = False  # True while VAD-detected speech is being streamed
+
+    # ── Per-session services (persistent WS connections to Sarvam) ───────
+    session_stt = SarvamStreamingSTT()
     session_tts = SarvamTTS()
 
     try:
+        # Connect STT and TTS WebSockets eagerly (parallel)
+        await asyncio.gather(
+            session_stt.connect(),
+            session_tts.connect(),
+        )
+        logger.info("STT + TTS WebSockets ready")
+
         while True:
             message = await ws.receive()
 
@@ -194,43 +186,50 @@ async def voice_websocket(ws: WebSocket) -> None:
                 break
 
             # ── JSON control messages ────────────────────────────────
-            if   "text" in message:
+            if "text" in message:
                 data = json.loads(message["text"])
                 msg_type = data.get("type", "")
 
-                if msg_type == "audio.start":
-                    # KICKOFF TTS CONNECT
-                    asyncio.create_task(session_tts.connect())
-                    
-                    audio_buffer = bytearray()
-                    recording_sample_rate = data.get("sampleRate", 48000)
-                    is_recording = True
-                    logger.info("Recording started  rate=%d", recording_sample_rate)
+                if msg_type == "speech.start":
+                    # VAD detected speech beginning
+                    is_speaking = True
+                    logger.info("Speech started (VAD)")
 
-                elif msg_type == "audio.end":
-                    is_recording = False
-                    logger.info("Recording ended  bytes=%d", len(audio_buffer))
+                elif msg_type == "speech.end":
+                    # VAD detected silence — user finished speaking
+                    is_speaking = False
+                    logger.info("Speech ended (VAD)")
 
-                    if len(audio_buffer) > 0:
-                        # Cancel any running pipeline
-                        if pipeline_task and not pipeline_task.done():
-                            pipeline_task.cancel()
-                            try:
-                                await pipeline_task
-                            except (asyncio.CancelledError, Exception):
-                                pass
+                    # Get transcript from streaming STT
+                    try:
+                        transcript = await session_stt.end_utterance()
+                    except Exception as exc:
+                        await _send_json(ws, {"type": "error", "message": f"STT failed: {exc}"})
+                        continue
 
-                        audio_bytes = bytes(audio_buffer)
-                        pipeline_task = asyncio.create_task(
-                            run_voice_pipeline(
-                                ws, audio_bytes, recording_sample_rate, conversation_history, session_tts
-                            )
+                    if not transcript or not transcript.strip():
+                        await _send_json(ws, {"type": "error", "message": "Could not understand audio."})
+                        continue
+
+                    await _send_json(ws, {"type": "stt.result", "text": transcript})
+
+                    # Cancel any running pipeline (e.g. barge-in already sent interrupt)
+                    if pipeline_task and not pipeline_task.done():
+                        pipeline_task.cancel()
+                        try:
+                            await pipeline_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+
+                    # Launch LLM → TTS pipeline
+                    pipeline_task = asyncio.create_task(
+                        run_voice_pipeline(
+                            ws, transcript, conversation_history, session_tts
                         )
-                    else:
-                        await _send_json(ws, {"type": "error", "message": "No audio received"})
+                    )
 
                 elif msg_type == "interrupt":
-                    logger.info("Interrupt requested")
+                    logger.info("Interrupt requested (barge-in)")
                     if pipeline_task and not pipeline_task.done():
                         pipeline_task.cancel()
                         try:
@@ -247,10 +246,13 @@ async def voice_websocket(ws: WebSocket) -> None:
                 elif msg_type == "ping":
                     await _send_json(ws, {"type": "pong"})
 
-            # ── Binary audio frames ──────────────────────────────────
+            # ── Binary audio frames (streamed from client VAD) ───────
             elif "bytes" in message:
-                if is_recording:
-                    audio_buffer.extend(message["bytes"])
+                if is_speaking:
+                    try:
+                        await session_stt.stream_audio(message["bytes"])
+                    except Exception as exc:
+                        logger.error("STT stream error: %s", exc)
 
     except WebSocketDisconnect:
         logger.info("Client disconnected")
@@ -259,7 +261,10 @@ async def voice_websocket(ws: WebSocket) -> None:
     finally:
         if pipeline_task and not pipeline_task.done():
             pipeline_task.cancel()
-        await session_tts.close()
+        await asyncio.gather(
+            session_stt.close(),
+            session_tts.close(),
+        )
         logger.info("Connection cleaned up")
 
 

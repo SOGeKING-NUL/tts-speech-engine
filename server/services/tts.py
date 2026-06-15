@@ -140,8 +140,8 @@ class SarvamTTS:
         self, text_chunks: AsyncGenerator[str, None]
     ) -> AsyncGenerator[bytes, None]:
         """
-        Open a TTS WebSocket, feed sentences from *text_chunks*, and yield
-        raw PCM-16 audio as it arrives.
+        Feed sentences from *text_chunks* into the persistent TTS WebSocket
+        and yield raw PCM-16 audio as it arrives.
 
         Audio arrives as base64-encoded WAV chunks inside JSON messages.
         We decode base64, strip the WAV header, and yield raw PCM16 bytes.
@@ -157,119 +157,105 @@ class SarvamTTS:
         """
         await self.connect()
 
+        ws = self.ws
+        if not ws:
+            raise RuntimeError("TTS WebSocket is not connected.")
+
+        text_done = asyncio.Event()
+
+        async def _send_text() -> None:
+            try:
+                async for chunk in text_chunks:
+                    chunk = chunk.strip()
+                    if not chunk:
+                        continue
+
+                    text_msg = {
+                        "type": "text",
+                        "data": {"text": chunk},
+                    }
+                    await ws.send(json.dumps(text_msg))
+                    logger.debug("TTS text sent: %.60s", chunk)
+
+                    await ws.send(json.dumps({"type": "flush"}))
+                    logger.debug("TTS flush sent")
+
+            except Exception as exc:  # noqa: BLE001
+                logger.error("TTS send error: %s", exc)
+            finally:
+                text_done.set()
+
+        send_task = asyncio.create_task(_send_text())
+
         try:
-            ws = self.ws
-            if not ws:
-                raise RuntimeError("TTS WebSocket is not connected.")
-
-            # ── 2. Background task: push text chunks ───────────────
-                text_done = asyncio.Event()
-
-                async def _send_text() -> None:
-                    try:
-                        async for chunk in text_chunks:
-                            chunk = chunk.strip()
-                            if not chunk:
-                                continue
-
-                            # Send text with data wrapper
-                            text_msg = {
-                                "type": "text",
-                                "data": {"text": chunk},
-                            }
-                            await ws.send(json.dumps(text_msg))
-                            logger.debug("TTS text sent: %.60s", chunk)
-
-                            # Send flush to trigger immediate synthesis
-                            await ws.send(json.dumps({"type": "flush"}))
-                            logger.debug("TTS flush sent")
-
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error("TTS send error: %s", exc)
-                    finally:
-                        text_done.set()
-
-                send_task = asyncio.create_task(_send_text())
-
-                # ── 3. Receive audio chunks ────────────────────────────
+            while True:
                 try:
-                    while True:
+                    message = await asyncio.wait_for(ws.recv(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    if text_done.is_set():
                         try:
-                            message = await asyncio.wait_for(ws.recv(), timeout=15.0)
+                            message = await asyncio.wait_for(
+                                ws.recv(), timeout=5.0
+                            )
                         except asyncio.TimeoutError:
-                            if text_done.is_set():
-                                # Grace period for trailing audio
-                                try:
-                                    message = await asyncio.wait_for(
-                                        ws.recv(), timeout=5.0
-                                    )
-                                except asyncio.TimeoutError:
-                                    logger.warning("TTS timed out after text done")
-                                    break
-                            else:
-                                # Text still streaming — keep waiting
-                                continue
+                            logger.warning("TTS timed out after text done")
+                            break
+                    else:
+                        continue
 
-                        if isinstance(message, bytes):
-                            # Raw binary audio (unlikely but handle it)
-                            yield message
+                if isinstance(message, bytes):
+                    yield message
+                else:
+                    data = json.loads(message)
+                    msg_type = data.get("type", "")
+
+                    if msg_type == "audio":
+                        audio_data = data.get("data", {})
+                        b64_audio = ""
+                        if isinstance(audio_data, dict):
+                            b64_audio = audio_data.get("audio", "")
+                        elif isinstance(audio_data, str):
+                            b64_audio = audio_data
+
+                        if b64_audio:
+                            wav_bytes = base64.b64decode(b64_audio)
+                            pcm_bytes = _strip_wav_header(wav_bytes)
+                            if pcm_bytes:
+                                yield pcm_bytes
                         else:
-                            # JSON message from server
-                            data = json.loads(message)
-                            msg_type = data.get("type", "")
+                            logger.warning("TTS audio message with no data")
 
-                            if msg_type == "audio":
-                                # Base64-encoded audio inside JSON
-                                audio_data = data.get("data", {})
-                                b64_audio = ""
-                                if isinstance(audio_data, dict):
-                                    b64_audio = audio_data.get("audio", "")
-                                elif isinstance(audio_data, str):
-                                    b64_audio = audio_data
+                    elif msg_type == "event":
+                        event_data = data.get("data", {})
+                        event_type = event_data.get("event_type", "")
+                        if event_type == "final":
+                            logger.info("TTS synthesis complete (final event)")
+                            break
+                        else:
+                            logger.debug("TTS event: %s", event_type)
 
-                                if b64_audio:
-                                    wav_bytes = base64.b64decode(b64_audio)
-                                    # Strip WAV header → raw PCM16
-                                    pcm_bytes = _strip_wav_header(wav_bytes)
-                                    if pcm_bytes:
-                                        yield pcm_bytes
-                                else:
-                                    logger.warning("TTS audio message with no data")
+                    elif msg_type == "completion":
+                        logger.info("TTS synthesis complete (completion)")
+                        break
 
-                            elif msg_type == "event":
-                                # Completion: {"type":"event","data":{"event_type":"final"}}
-                                event_data = data.get("data", {})
-                                event_type = event_data.get("event_type", "")
-                                if event_type == "final":
-                                    logger.info("TTS synthesis complete (final event)")
-                                    break
-                                else:
-                                    logger.debug("TTS event: %s", event_type)
+                    elif msg_type == "error":
+                        err_data = data.get("data", {})
+                        err_msg = err_data.get("message", str(data))
+                        logger.error("TTS error: %s", err_msg)
+                        break
 
-                            elif msg_type == "completion":
-                                # Alternate completion format (older API)
-                                logger.info("TTS synthesis complete (completion)")
-                                break
+                    else:
+                        logger.debug("TTS msg type=%s", msg_type)
 
-                            elif msg_type == "error":
-                                err_data = data.get("data", {})
-                                err_msg = err_data.get("message", str(data))
-                                logger.error("TTS error: %s", err_msg)
-                                break
-
-                            else:
-                                logger.debug("TTS msg type=%s", msg_type)
-
-                except websockets.exceptions.ConnectionClosed as exc:
-                    logger.warning("TTS WS closed: %s", exc)
-
-                # ── 4. Cleanup ─────────────────────────────────────────
-                send_task.cancel()
-                try:
-                    await send_task
-                except asyncio.CancelledError:
-                    pass
-
+        except websockets.exceptions.ConnectionClosed as exc:
+            logger.warning("TTS WS closed: %s", exc)
         except Exception as exc:
             logger.error("TTS connection error: %s", exc)
             raise
+        finally:
+            send_task.cancel()
+            try:
+                await send_task
+            except asyncio.CancelledError:
+                pass
+

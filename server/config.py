@@ -18,8 +18,9 @@ class Settings:
     SARVAM_TTS_MODEL: str = os.getenv("SARVAM_TTS_MODEL", "bulbul:v2")
     SARVAM_TTS_SAMPLE_RATE: int = int(os.getenv("SARVAM_TTS_SAMPLE_RATE", "22050"))
 
-    SARVAM_STT_LANGUAGE: str = os.getenv("SARVAM_STT_LANGUAGE", "en-IN")
+    SARVAM_STT_LANGUAGE: str = os.getenv("SARVAM_STT_LANGUAGE", "unknown")
     SARVAM_STT_MODEL: str = os.getenv("SARVAM_STT_MODEL", "saaras:v3")
+    SARVAM_STT_MODE: str = os.getenv("SARVAM_STT_MODE", "codemix")
 
     GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
     LLM_MODEL: str = os.getenv("LLM_MODEL", "gemini-2.5-flash")

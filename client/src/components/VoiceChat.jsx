@@ -79,6 +79,7 @@ export default function VoiceChat() {
         if (data.sampleRate) {
           playerRef.current.setSampleRate(data.sampleRate);
         }
+        
         // Resume VAD so barge-in can be detected while AI speaks
         vadRef.current?.resume();
         break;
