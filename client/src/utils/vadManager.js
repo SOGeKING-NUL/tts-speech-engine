@@ -1,9 +1,11 @@
 /**
  * vadManager.js — Thin wrapper around @ricky0123/vad-web (Silero VAD).
  *
- * Provides start/pause/resume/destroy lifecycle and accepts callbacks
- * for speech events. Runs the Silero ONNX model locally in the browser
- * via WebAssembly for ~1ms speech detection latency.
+ * In the hybrid architecture, VAD has ONE job: instant barge-in detection.
+ * End-of-turn detection is handled server-side by Deepgram.
+ *
+ * The VAD also exposes every audio frame via onFrameProcessed so the
+ * client can stream raw PCM to the server continuously.
  */
 import { MicVAD } from "@ricky0123/vad-web";
 import * as ort from "onnxruntime-web";
@@ -13,10 +15,9 @@ ort.env.wasm.wasmPaths = "/";
 
 /**
  * @typedef {Object} VADCallbacks
- * @property {() => void}              onSpeechStart  - Fires the instant voice is detected.
- * @property {(audio: Float32Array) => void} onSpeechEnd - Fires when silence follows speech.
- *           `audio` contains the complete utterance PCM at 16 kHz mono.
- * @property {(probs: {isSpeech: number}) => void} [onFrameProcessed] - Every ~32ms frame.
+ * @property {() => void}                        onSpeechStart     - Fires instantly when voice is detected.
+ * @property {(audio: Float32Array) => void}     onSpeechEnd       - Fires when silence follows speech.
+ * @property {(probs: Object, frame: Float32Array) => void} onFrameProcessed - Every ~32ms audio frame.
  */
 
 export class VADManager {
@@ -25,7 +26,6 @@ export class VADManager {
     this.callbacks = callbacks;
     /** @type {MicVAD | null} */
     this.vad = null;
-    this.paused = false;
   }
 
   /**
@@ -37,12 +37,15 @@ export class VADManager {
       model: "v5",
       modelURL: "/silero_vad_v5.onnx",
       workletURL: "/vad.worklet.bundle.min.js",
+
       // ── Detection thresholds ───────────────────────────────────
-      positiveSpeechThreshold: 0.75,
-      negativeSpeechThreshold: 0.15,
-      minSpeechMs: 160,             // require 160ms of speech (filters clicks/pops)
-      preSpeechPadMs: 256,          // capture 256ms before speech detected (no clipped words)
-      redemptionMs: 3000,           // 3 seconds of patience for telephone-style 'thinking pauses'
+      // These are tuned for BARGE-IN only. We don't care about
+      // redemptionMs for end-of-turn — Deepgram handles that.
+      positiveSpeechThreshold: 0.8,   // high confidence needed to trigger
+      negativeSpeechThreshold: 0.3,   // drop threshold
+      minSpeechMs: 150,               // ignore clicks/pops shorter than 150ms
+      preSpeechPadMs: 0,              // we handle pre-speech via ring buffer
+      redemptionMs: 600,              // only affects onSpeechEnd timing (UI hint)
 
       // ── Audio constraints ──────────────────────────────────────
       getStream: async () => {
@@ -57,37 +60,23 @@ export class VADManager {
         });
       },
 
+
+
       // ── Callbacks ──────────────────────────────────────────────
       onSpeechStart: () => {
-        if (!this.paused) {
-          this.callbacks.onSpeechStart();
-        }
+        this.callbacks.onSpeechStart?.();
       },
 
       onSpeechEnd: (audio) => {
-        if (!this.paused) {
-          this.callbacks.onSpeechEnd(audio);
-        }
+        this.callbacks.onSpeechEnd?.(audio);
       },
 
-      onFrameProcessed: (probs) => {
-        if (!this.paused && this.callbacks.onFrameProcessed) {
-          this.callbacks.onFrameProcessed(probs);
-        }
+      onFrameProcessed: (probs, frame) => {
+        this.callbacks.onFrameProcessed?.(probs, frame);
       },
     });
 
-    this.vad.start();
-  }
-
-  /** Temporarily ignore VAD events (e.g. while AI is speaking). */
-  pause() {
-    this.paused = true;
-  }
-
-  /** Resume listening for VAD events. */
-  resume() {
-    this.paused = false;
+    // The VAD will start automatically because startOnLoad is true by default
   }
 
   /** Fully tear down the VAD pipeline and release the microphone. */
@@ -96,6 +85,5 @@ export class VADManager {
       this.vad.destroy();
       this.vad = null;
     }
-    this.paused = false;
   }
 }

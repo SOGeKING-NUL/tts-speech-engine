@@ -22,6 +22,13 @@ class Settings:
     SARVAM_STT_MODEL: str = os.getenv("SARVAM_STT_MODEL", "saaras:v3")
     SARVAM_STT_MODE: str = os.getenv("SARVAM_STT_MODE", "codemix")
 
+    # ── Deepgram STT (server-side end-of-turn detection) ──────
+    DEEPGRAM_API_KEY: str = os.getenv("DEEPGRAM_API_KEY", "")
+    DEEPGRAM_MODEL: str = os.getenv("DEEPGRAM_MODEL", "nova-3")
+    DEEPGRAM_LANGUAGE: str = os.getenv("DEEPGRAM_LANGUAGE", "multi")
+    DEEPGRAM_ENDPOINTING_MS: int = int(os.getenv("DEEPGRAM_ENDPOINTING_MS", "500"))
+    DEEPGRAM_UTTERANCE_END_MS: int = int(os.getenv("DEEPGRAM_UTTERANCE_END_MS", "1500"))
+
     GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
     LLM_MODEL: str = os.getenv("LLM_MODEL", "gemini-2.5-flash")
     LLM_SYSTEM_PROMPT: str = os.getenv(

@@ -1,11 +1,12 @@
 /**
  * VoiceChat — Always-on voice conversation component.
  *
- * Wires together:
- *   VADManager (Silero)  →  WebSocket  →  AudioPlayer  →  UI
+ * Hybrid VAD Architecture:
+ *   Client Silero VAD (barge-in) → Continuous audio stream → Server
+ *   Server: Deepgram STT (endpointing) → LLM → Sarvam TTS → Client audio
  *
  * No buttons needed — speech is detected automatically via client-side
- * Voice Activity Detection. Supports barge-in interruption.
+ * Voice Activity Detection. Supports instant barge-in interruption.
  */
 import { useState, useEffect, useRef, useCallback } from "react";
 import ChatMessage from "./ChatMessage";
@@ -17,11 +18,15 @@ const WS_URL =
   import.meta.env.VITE_WS_URL ||
   `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws/voice`;
 
+// Pre-speech ring buffer: ~500ms of audio frames for capturing speech onset
+const RING_BUFFER_FRAMES = 15; // 15 frames × 32ms = ~480ms
+
 export default function VoiceChat() {
   // ── State ──────────────────────────────────────────────────────────
   const [messages, setMessages] = useState([]);
   const [status, setStatus] = useState("idle"); // idle|listening|recording|processing|speaking
   const [currentResponse, setCurrentResponse] = useState("");
+  const [interimTranscript, setInterimTranscript] = useState("");
   const [isConnected, setIsConnected] = useState(false);
 
   // ── Refs (survive re-renders, avoid stale closures) ────────────────
@@ -34,6 +39,10 @@ export default function VoiceChat() {
   const messagesEndRef = useRef(null);
   const statusRef = useRef("idle");
 
+  // ── Streaming control refs ─────────────────────────────────────────
+
+  const audioRingBufferRef = useRef([]);      // ring buffer for pre-speech capture
+
   // Keep statusRef in sync
   useEffect(() => {
     statusRef.current = status;
@@ -42,12 +51,36 @@ export default function VoiceChat() {
   // ── Auto-scroll ────────────────────────────────────────────────────
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, currentResponse]);
+  }, [messages, currentResponse, interimTranscript]);
 
-  // ── Resume VAD listening (called after TTS finishes or interrupt) ──
+  // ── Helper: convert Float32 frame → PCM16 and send via WebSocket ──
+  const frameCountRef = useRef(0);
+  
+  const sendAudioFrame = useCallback((frame) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    const pcm16 = new Int16Array(frame.length);
+    for (let i = 0; i < frame.length; i++) {
+      const s = Math.max(-1, Math.min(1, frame[i]));
+      pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    ws.send(pcm16.buffer);
+    
+    frameCountRef.current++;
+    if (frameCountRef.current === 1) {
+      console.log("Started sending audio frames to server!");
+    } else if (frameCountRef.current % 100 === 0) {
+      console.log(`Sent ${frameCountRef.current} audio frames so far...`);
+    }
+  }, []);
+
+  // ── Resume listening (called after TTS finishes) ──────────────────
   const resumeListening = useCallback(() => {
+    statusRef.current = "listening";
     setStatus("listening");
-    vadRef.current?.resume();
+
+    setInterimTranscript("");
   }, []);
 
   // ── WebSocket message handler ──────────────────────────────────────
@@ -55,12 +88,33 @@ export default function VoiceChat() {
     switch (data.type) {
       case "processing":
         setStatus("processing");
+        statusRef.current = "processing";
+        break;
+
+      case "stt.interim":
+        // Real-time partial transcript — show as ghost text
+        setInterimTranscript(data.text);
+        if (statusRef.current === "listening") {
+          setStatus("recording");
+          statusRef.current = "recording";
+        }
+        break;
+
+      case "stt.final":
+        // Finalized segment (but utterance may continue)
+        setInterimTranscript(data.text);
         break;
 
       case "stt.result":
+        // Deepgram utterance_end — final transcript, stop streaming
+        setInterimTranscript("");
         setMessages((prev) => [...prev, { role: "user", text: data.text }]);
+    
+        statusRef.current = "processing";
+        setStatus("processing");
         break;
 
+      // ── LLM events ────────────────────────────────────────────
       case "llm.token":
         setCurrentResponse((prev) => {
           const next = prev + data.text;
@@ -73,16 +127,15 @@ export default function VoiceChat() {
         llmDoneTextRef.current = data.text || "";
         break;
 
+      // ── TTS events ────────────────────────────────────────────
       case "tts.start":
         setStatus("speaking");
+        statusRef.current = "speaking";
         // Reset player for fresh playback session
         playerRef.current.stop();
         if (data.sampleRate) {
           playerRef.current.setSampleRate(data.sampleRate);
         }
-        
-        // Resume VAD so barge-in can be detected while AI speaks
-        vadRef.current?.resume();
         break;
 
       case "tts.done": {
@@ -109,6 +162,7 @@ export default function VoiceChat() {
         break;
       }
 
+      // ── Control events ────────────────────────────────────────
       case "error":
         console.error("Server error:", data.message);
         if (currentResponseRef.current) {
@@ -128,8 +182,8 @@ export default function VoiceChat() {
         setCurrentResponse("");
         currentResponseRef.current = "";
         llmDoneTextRef.current = "";
-        // Don't resume listening here — the new speech that triggered
-        // the barge-in is still being captured by VAD
+        setInterimTranscript("");
+        // Don't resume listening — the barge-in speech is still active
         break;
 
       case "history_cleared":
@@ -153,30 +207,44 @@ export default function VoiceChat() {
       ws.binaryType = "arraybuffer";
 
       ws.onopen = () => {
+        if (closed) return;
         console.log("WS connected");
         setIsConnected(true);
         setStatus("listening");
+        statusRef.current = "listening";
+      };
+
+      ws.onmessage = (event) => {
+        if (closed) return;
+        if (typeof event.data === "string") {
+          try {
+            handleMessage(JSON.parse(event.data));
+          } catch (err) {
+            console.error("Failed to parse WS message:", err);
+          }
+        } else if (event.data instanceof ArrayBuffer) {
+          // Binary audio from TTS — queue for playback
+          playerRef.current.playChunk(event.data);
+        }
       };
 
       ws.onclose = () => {
         console.log("WS disconnected");
+        if (closed) return; // Prevent state corruption from unmounted StrictMode components
+        
         setIsConnected(false);
         setStatus("idle");
-        if (!closed) reconnectTimer = setTimeout(connect, 3000);
+        statusRef.current = "idle";
+        if (wsRef.current === ws) {
+          wsRef.current = null;
+        }
+        reconnectTimer = setTimeout(connect, 2000);
       };
 
-      ws.onerror = (e) => console.error("WS error", e);
-
-      ws.onmessage = (event) => {
-        if (event.data instanceof ArrayBuffer) {
-          playerRef.current.playChunk(event.data);
-        } else {
-          try {
-            handleMessage(JSON.parse(event.data));
-          } catch (err) {
-            console.error("Bad JSON from server", err);
-          }
-        }
+      ws.onerror = (err) => {
+        if (closed) return;
+        console.error("WS error:", err);
+        ws.close();
       };
 
       wsRef.current = ws;
@@ -184,18 +252,10 @@ export default function VoiceChat() {
 
     connect();
 
-    // Keepalive ping every 25 s
-    const pingInterval = setInterval(() => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: "ping" }));
-      }
-    }, 25_000);
-
     return () => {
       closed = true;
       clearTimeout(reconnectTimer);
-      clearInterval(pingInterval);
-      ws?.close();
+      if (ws) ws.close();
     };
   }, [handleMessage]);
 
@@ -209,49 +269,61 @@ export default function VoiceChat() {
         const ws = wsRef.current;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-        // Guard: if VAD fires twice rapidly, the second call sees the
-        // synchronously updated ref and bails out.
+        // Guard: ignore if already recording or processing
         if (currentStatus === "recording" || currentStatus === "processing") return;
 
         // Barge-in: if AI is speaking, interrupt it first
         if (currentStatus === "speaking") {
           playerRef.current.stop();
           ws.send(JSON.stringify({ type: "interrupt" }));
+          
+          // Since we weren't streaming while speaking, flush the ring buffer
+          // to Deepgram so it catches the words that triggered the barge-in
+          for (const bufferedFrame of audioRingBufferRef.current) {
+            sendAudioFrame(bufferedFrame);
+          }
         }
+        
+        audioRingBufferRef.current = [];
 
-        // Update ref synchronously BEFORE the async React setState,
-        // so a second rapid-fire callback will see "recording" and exit.
+        // Update ref synchronously BEFORE async React setState
         statusRef.current = "recording";
-
-        // Tell server speech has started
+        
+        // Let server know VAD thinks speech started (optional, since Deepgram handles it, but good for logs/UI)
         ws.send(JSON.stringify({ type: "speech.start" }));
         setStatus("recording");
+        setInterimTranscript("");
       },
 
-      onSpeechEnd: (audio) => {
-        const ws = wsRef.current;
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      onSpeechEnd: () => {
+        // In the hybrid architecture, we do NOT stop streaming here.
+        // Deepgram handles end-of-turn detection on the server.
+        // Just update the UI indicator as a visual hint.
+        if (statusRef.current === "recording") {
+          // Keep streaming! Don't set isStreamingRef to false.
+          // Deepgram needs to "hear" the silence to fire utterance_end.
+        }
+      },
 
-        // Convert Float32 (16kHz mono from VAD) → PCM-16 bytes
-        const pcm16 = new Int16Array(audio.length);
-        for (let i = 0; i < audio.length; i++) {
-          const s = Math.max(-1, Math.min(1, audio[i]));
-          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      onFrameProcessed: (probs, frame) => {
+        if (!frame) return;
+
+        // Keep a rolling buffer of ~500ms
+        audioRingBufferRef.current.push(new Float32Array(frame));
+        if (audioRingBufferRef.current.length > RING_BUFFER_FRAMES) {
+          audioRingBufferRef.current.shift();
         }
 
-        // Send the complete utterance audio as binary
-        ws.send(pcm16.buffer);
-
-        // Tell server speech has ended
-        ws.send(JSON.stringify({ type: "speech.end" }));
-        setStatus("processing");
-
-        // Pause VAD while server processes (re-enabled on tts.start or tts.done)
-        vadRef.current?.pause();
-      },
-
-      onFrameProcessed: (_probs) => {
-        // Could be used for visual volume indicators in the future
+        const currentStatus = statusRef.current;
+        if (audioRingBufferRef.current.length === 1) {
+           console.log("VAD is processing frames! Current status:", currentStatus);
+        }
+        
+        // In the hybrid architecture, we stream microphone audio to Deepgram
+        // as long as we are listening/recording. Deepgram handles VAD server-side.
+        if (currentStatus === "listening" || currentStatus === "recording") {
+          sendAudioFrame(frame);
+        }
       },
     });
 
@@ -260,12 +332,10 @@ export default function VoiceChat() {
     // Start VAD (requests mic permission)
     vad.start().then(() => {
       console.log("VAD started — listening for speech");
-      // Resume AudioContext (needs user gesture — handled by the launch button in App.jsx)
+      // Resume AudioContext (needs user gesture)
       playerRef.current.resume();
 
-      // Bind the AudioPlayer's output stream to the hidden <audio> element.
-      // This is the AEC bridge: Chrome's echo cancellation properly tracks
-      // <audio> elements but NOT raw Web Audio API nodes.
+      // Bind AudioPlayer output to hidden <audio> element for AEC
       const stream = playerRef.current.getOutputStream();
       if (audioElRef.current && stream) {
         audioElRef.current.srcObject = stream;
@@ -278,8 +348,9 @@ export default function VoiceChat() {
     return () => {
       vad.destroy();
       vadRef.current = null;
+      audioRingBufferRef.current = [];
     };
-  }, [isConnected]);
+  }, [isConnected, sendAudioFrame]);
 
   // ── Clear history handler ──────────────────────────────────────────
   const handleClearHistory = () => {
@@ -323,7 +394,7 @@ export default function VoiceChat() {
 
       {/* ── Messages ───────────────────────────────────────────────── */}
       <main className="messages" id="messages-container">
-        {messages.length === 0 && !currentResponse && (
+        {messages.length === 0 && !currentResponse && !interimTranscript && (
           <div className="empty-state">
             <div className="empty-icon">🎙️</div>
             <p className="empty-text">Just start speaking — I'm listening</p>
@@ -333,6 +404,14 @@ export default function VoiceChat() {
         {messages.map((msg, i) => (
           <ChatMessage key={i} message={msg} />
         ))}
+
+        {/* Interim transcript — shows what user is saying in real-time */}
+        {interimTranscript && (
+          <ChatMessage
+            message={{ role: "user", text: interimTranscript }}
+            streaming
+          />
+        )}
 
         {currentResponse && (
           <ChatMessage
@@ -349,10 +428,7 @@ export default function VoiceChat() {
         <StatusIndicator status={status} />
       </footer>
 
-      {/* Hidden <audio> element for AEC (Acoustic Echo Cancellation).
-          Chrome's AEC only cancels audio played through <audio>/<video> elements,
-          NOT raw Web Audio API nodes. The AudioPlayer routes all its output
-          through a MediaStreamAudioDestinationNode, and we bind that stream here. */}
+      {/* Hidden <audio> element for AEC (Acoustic Echo Cancellation). */}
       {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
       <audio ref={audioElRef} autoPlay style={{ display: "none" }} />
     </div>

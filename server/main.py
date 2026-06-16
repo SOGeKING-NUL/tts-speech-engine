@@ -2,7 +2,12 @@
 TTS Speech Engine — FastAPI server.
 
 Single WebSocket endpoint ``/ws/voice`` orchestrates:
-    Client audio (streamed via VAD) → STT (streaming) → LLM (streaming) → TTS (streaming) → Client audio
+    Client audio (continuous stream) → Deepgram STT (server-side endpointing) → LLM (streaming) → Sarvam TTS (streaming) → Client audio
+
+Architecture:
+    - Client-side Silero VAD handles instant barge-in detection (~10ms)
+    - Deepgram Nova-3 handles end-of-turn detection via server-side endpointing
+    - Sarvam Bulbul handles text-to-speech synthesis
 """
 
 import asyncio
@@ -13,7 +18,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
-from services.stt import SarvamStreamingSTT
+from services.stt_deepgram import DeepgramStreamingSTT
 from services.tts import SarvamTTS
 from services.llm import GeminiLLM
 
@@ -25,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger("engine")
 
 # ── App & middleware ─────────────────────────────────────────────────────
-app = FastAPI(title="TTS Speech Engine", version="0.2.0")
+app = FastAPI(title="TTS Speech Engine", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,7 +59,7 @@ async def _send_json(ws: WebSocket, data: dict) -> None:
 
 
 # ═════════════════════════════════════════════════════════════════════════
-#  Voice pipeline (LLM → TTS only — STT is handled before this)
+#  Voice pipeline (LLM → TTS only — STT is handled by Deepgram callbacks)
 # ═════════════════════════════════════════════════════════════════════════
 async def run_voice_pipeline(
     ws: WebSocket,
@@ -65,7 +70,7 @@ async def run_voice_pipeline(
     """
     LLM → TTS cascade for one user turn.
 
-    Receives a pre-computed transcript (from streaming STT) and runs it
+    Receives a pre-computed transcript (from Deepgram utterance_end) and runs it
     through the LLM and TTS pipeline concurrently.
     """
 
@@ -157,26 +162,73 @@ async def run_voice_pipeline(
 # ═════════════════════════════════════════════════════════════════════════
 @app.websocket("/ws/voice")
 async def voice_websocket(ws: WebSocket) -> None:
-    """Handle a full-duplex voice conversation session."""
+    """
+    Handle a full-duplex voice conversation session.
+
+    Architecture (Hybrid VAD):
+      - Client-side Silero VAD detects speech start → instant barge-in
+      - Client streams raw PCM-16 audio continuously to this server
+      - Server forwards audio to Deepgram Nova-3 for transcription
+      - Deepgram's built-in endpointing detects end-of-turn
+      - utterance_end event triggers the LLM → TTS pipeline
+    """
     await ws.accept()
     logger.info("Client connected")
 
     # ── Per-session state ────────────────────────────────────────────────
     conversation_history: list[dict] = []
     pipeline_task: asyncio.Task | None = None
-    is_speaking = False  # True while VAD-detected speech is being streamed
 
-    # ── Per-session services (persistent WS connections to Sarvam) ───────
-    session_stt = SarvamStreamingSTT()
+    # ── Per-session services ─────────────────────────────────────────────
     session_tts = SarvamTTS()
+    session_stt = DeepgramStreamingSTT()
 
-    try:
-        # Connect STT and TTS WebSockets eagerly (parallel)
-        await asyncio.gather(
-            session_stt.connect(),
-            session_tts.connect(),
+    # ── Deepgram callbacks (closures with access to session state) ────────
+
+    async def on_interim_transcript(text: str) -> None:
+        """Forward interim (partial) transcript to client for real-time display."""
+        await _send_json(ws, {"type": "stt.interim", "text": text})
+
+    async def on_final_transcript(text: str) -> None:
+        """Forward finalized transcript segment to client."""
+        await _send_json(ws, {"type": "stt.final", "text": text})
+
+    async def on_utterance_end(transcript: str) -> None:
+        """Deepgram detected end-of-turn — trigger the LLM → TTS pipeline."""
+        nonlocal pipeline_task
+
+        logger.info("Utterance complete → %s", transcript)
+
+        # Tell client we have the final result (client stops streaming audio)
+        await _send_json(ws, {"type": "stt.result", "text": transcript})
+
+        # Cancel any running pipeline (e.g. from a previous turn)
+        if pipeline_task and not pipeline_task.done():
+            pipeline_task.cancel()
+            try:
+                await pipeline_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            # Reset TTS connection to drop any pending audio
+            await session_tts.close()
+            await session_tts.connect()
+
+        # Launch LLM → TTS pipeline
+        pipeline_task = asyncio.create_task(
+            run_voice_pipeline(ws, transcript, conversation_history, session_tts)
         )
-        logger.info("STT + TTS WebSockets ready")
+
+    # ── Main loop ────────────────────────────────────────────────────────
+    try:
+        # Connect TTS eagerly (it's used for every response)
+        await session_tts.connect()
+        # Connect STT eagerly since we stream continuously
+        await session_stt.connect(
+            on_interim=on_interim_transcript,
+            on_final=on_final_transcript,
+            on_utterance_end=on_utterance_end,
+        )
+        logger.info("STT & TTS WebSockets ready — waiting for speech")
 
         while True:
             message = await ws.receive()
@@ -191,49 +243,13 @@ async def voice_websocket(ws: WebSocket) -> None:
                 msg_type = data.get("type", "")
 
                 if msg_type == "speech.start":
-                    # VAD detected speech beginning
-                    is_speaking = True
+                    # Client VAD detected speech — reset Deepgram transcript just in case
                     logger.info("Speech started (VAD)")
-
-                elif msg_type == "speech.end":
-                    # VAD detected silence — user finished speaking
-                    is_speaking = False
-                    logger.info("Speech ended (VAD)")
-
-                    # Get transcript from streaming STT
-                    try:
-                        transcript = await session_stt.end_utterance()
-                    except Exception as exc:
-                        await _send_json(ws, {"type": "error", "message": f"STT failed: {exc}"})
-                        continue
-
-                    if not transcript or not transcript.strip():
-                        await _send_json(ws, {"type": "error", "message": "Could not understand audio."})
-                        continue
-
-                    await _send_json(ws, {"type": "stt.result", "text": transcript})
-
-                    # Cancel any running pipeline (e.g. barge-in already sent interrupt)
-                    if pipeline_task and not pipeline_task.done():
-                        pipeline_task.cancel()
-                        try:
-                            await pipeline_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                        
-                        # Force close the TTS socket to drop any pending audio chunks
-                        # from the previous pipeline that was just cancelled.
-                        await session_tts.close()
-                        await session_tts.connect()
-
-                    # Launch LLM → TTS pipeline
-                    pipeline_task = asyncio.create_task(
-                        run_voice_pipeline(
-                            ws, transcript, conversation_history, session_tts
-                        )
-                    )
+                    if session_stt.ws is not None:
+                        session_stt.reset_transcript()
 
                 elif msg_type == "interrupt":
+                    # Client VAD detected barge-in
                     logger.info("Interrupt requested (barge-in)")
                     if pipeline_task and not pipeline_task.done():
                         pipeline_task.cancel()
@@ -241,13 +257,17 @@ async def voice_websocket(ws: WebSocket) -> None:
                             await pipeline_task
                         except (asyncio.CancelledError, Exception):
                             pass
-                        
-                        # The pipeline is dead, but the Sarvam server doesn't know that.
-                        # It will keep streaming audio for the old prompt. We MUST reset
-                        # the connection to physically severe the old audio stream.
+                        # Reset TTS to drop pending audio from old pipeline
                         await session_tts.close()
                         await session_tts.connect()
-                        
+
+                    # Reset Deepgram for fresh session (drops old partial transcripts)
+                    await session_stt.close()
+                    await session_stt.connect(
+                        on_interim=on_interim_transcript,
+                        on_final=on_final_transcript,
+                        on_utterance_end=on_utterance_end,
+                    )
                     await _send_json(ws, {"type": "interrupted"})
 
                 elif msg_type == "clear_history":
@@ -258,13 +278,13 @@ async def voice_websocket(ws: WebSocket) -> None:
                 elif msg_type == "ping":
                     await _send_json(ws, {"type": "pong"})
 
-            # ── Binary audio frames (streamed from client VAD) ───────
+            # ── Binary audio frames → forward to Deepgram ────────────
             elif "bytes" in message:
-                if is_speaking:
-                    try:
-                        await session_stt.stream_audio(message["bytes"])
-                    except Exception as exc:
-                        logger.error("STT stream error: %s", exc)
+                # Log the very first chunk to confirm audio is arriving
+                if not hasattr(ws, "_audio_received"):
+                    logger.info("First client audio chunk received (%d bytes)", len(message["bytes"]))
+                    ws._audio_received = True
+                await session_stt.send_audio(message["bytes"])
 
     except WebSocketDisconnect:
         logger.info("Client disconnected")
@@ -273,6 +293,10 @@ async def voice_websocket(ws: WebSocket) -> None:
     finally:
         if pipeline_task and not pipeline_task.done():
             pipeline_task.cancel()
+            try:
+                await pipeline_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await asyncio.gather(
             session_stt.close(),
             session_tts.close(),
