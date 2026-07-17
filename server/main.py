@@ -1,18 +1,25 @@
 """
 TTS Speech Engine — FastAPI server.
 
-Single WebSocket endpoint ``/ws/voice`` orchestrates:
-    Client audio (continuous stream) → Deepgram STT (server-side endpointing) → LLM (streaming) → Sarvam TTS (streaming) → Client audio
+One WebSocket endpoint (/ws/voice) runs the whole voice loop:
 
-Architecture:
-    - Client-side Silero VAD handles instant barge-in detection (~10ms)
-    - Deepgram Nova-3 handles end-of-turn detection via server-side endpointing
-    - Sarvam Bulbul handles text-to-speech synthesis
+    client mic audio ──▶ Deepgram STT ──▶ Gemini LLM ──▶ Sarvam TTS ──▶ client speaker
+
+How a turn works:
+  1. The client streams raw PCM-16 audio continuously; we forward it to Deepgram.
+  2. Deepgram sends back interim/final transcripts, and an "utterance end"
+     event when the speaker goes silent (server-side end-of-turn detection).
+  3. On utterance end we stream the transcript through the LLM, cut the LLM
+     output into sentences, and feed each sentence to TTS as soon as it is
+     complete — so speech starts before the LLM has finished writing.
+  4. Barge-in: the client's local Silero VAD detects the user speaking over
+     the AI and sends {"type": "interrupt"}; we cancel the running pipeline.
 """
 
 import asyncio
 import json
 import logging
+import time
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,16 +27,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import settings
 from services.stt_deepgram import DeepgramStreamingSTT
 from services.tts import SarvamTTS
-from services.llm import GeminiLLM
+from services.llm import OpenRouterLLM
 
-# ── Logging ──────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
 logger = logging.getLogger("engine")
 
-# ── App & middleware ─────────────────────────────────────────────────────
 app = FastAPI(title="TTS Speech Engine", version="0.3.0")
 
 app.add_middleware(
@@ -40,250 +45,273 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Global services (stateless, shared across connections) ───────────────
-llm_service = GeminiLLM()
+# The LLM client is stateless, so one instance is shared by all connections.
+llm_service = OpenRouterLLM()
 
-# ── Sentence-boundary characters ────────────────────────────────────────
+# Characters that end a sentence (includes Devanagari danda "।").
 _SENTENCE_ENDERS = frozenset(".!?।;:")
 
 
-# ═════════════════════════════════════════════════════════════════════════
-#  Helper
-# ═════════════════════════════════════════════════════════════════════════
+class TurnTimer:
+    """
+    Records latency marks for one user turn and logs a breakdown.
+
+    t0 is the moment the pipeline starts (Deepgram's utterance_end). Every
+    mark is stored as milliseconds since t0; `mark()` is idempotent so the
+    first-token / first-audio marks can be called freely and only the first
+    (the one we care about) is kept.
+    """
+
+    def __init__(self) -> None:
+        self.t0 = time.perf_counter()
+        self.marks: dict[str, float] = {}
+
+    def mark(self, name: str) -> None:
+        if name not in self.marks:
+            ms = (time.perf_counter() - self.t0) * 1000
+            self.marks[name] = ms
+            logger.info("[timing] %-20s %7.0f ms", name, ms)
+
+    def summary(self, stt_ms: float | None) -> None:
+        """Log a per-stage breakdown once the turn is fully done."""
+        m = self.marks
+        lines = ["", "-------- turn latency breakdown --------"]
+        if stt_ms is not None:
+            lines.append(f"  STT   speech -> end-of-turn     {stt_ms:7.0f} ms")
+        if "llm_first_token" in m:
+            lines.append(f"  LLM   -> first token            {m['llm_first_token']:7.0f} ms")
+        if "llm_first_sentence" in m:
+            lines.append(f"  LLM   -> first sentence         {m['llm_first_sentence']:7.0f} ms")
+        if "tts_first_audio" in m:
+            # TTS round-trip: time from handing TTS the first sentence to the
+            # first audio bytes coming back. This is the "after LLM" latency.
+            ttfb = m["tts_first_audio"] - m.get("llm_first_sentence", 0.0)
+            lines.append(f"  TTS   first sentence -> audio   {ttfb:7.0f} ms")
+            lines.append(f"  >>    utterance -> first audio  {m['tts_first_audio']:7.0f} ms")
+            if stt_ms is not None:
+                total = stt_ms + m["tts_first_audio"]
+                lines.append(f"  **    speech -> first audio out {total:7.0f} ms  <- perceived latency")
+        if "llm_done" in m:
+            lines.append(f"  LLM   total (-> done)           {m['llm_done']:7.0f} ms")
+        if "tts_done" in m:
+            lines.append(f"  TTS   total (-> done)           {m['tts_done']:7.0f} ms")
+        lines.append("----------------------------------------")
+        logger.info("\n".join(lines))
+
+
 async def _send_json(ws: WebSocket, data: dict) -> None:
-    """Send a JSON text frame — silently ignores closed connections."""
+    """Send a JSON frame; ignore errors if the client already disconnected."""
     try:
         await ws.send_json(data)
     except Exception:  # noqa: BLE001
         pass
 
 
-# ═════════════════════════════════════════════════════════════════════════
-#  Voice pipeline (LLM → TTS only — STT is handled by Deepgram callbacks)
-# ═════════════════════════════════════════════════════════════════════════
 async def run_voice_pipeline(
     ws: WebSocket,
     transcript: str,
     conversation_history: list[dict],
     tts_service: SarvamTTS,
+    timer: TurnTimer,
+    stt_ms: float | None,
 ) -> None:
     """
     LLM → TTS cascade for one user turn.
 
-    Receives a pre-computed transcript (from Deepgram utterance_end) and runs it
-    through the LLM and TTS pipeline concurrently.
-    """
+    Two tasks run concurrently, connected by a queue of sentences:
+      producer: streams LLM tokens, groups them into sentences, puts them
+                on the queue (None = no more sentences).
+      consumer: pulls sentences off the queue, sends them to TTS, and
+                streams the resulting PCM audio back to the client.
 
-    # ── LLM + TTS (concurrent) ───────────────────────────────────────────
+    This overlap is what makes the assistant start speaking while the LLM
+    is still generating the rest of its answer.
+
+    `timer` is stamped at each stage so we can log where the latency goes;
+    `stt_ms` is how long Deepgram took (speech → end-of-turn) for the summary.
+    """
     await _send_json(ws, {"type": "processing", "stage": "llm"})
 
     sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
     full_response_parts: list[str] = []
 
-    # ── Task A: stream LLM → buffer sentences → push to queue ───────────
     async def _llm_to_sentences() -> None:
+        """Producer: LLM tokens → complete sentences → queue."""
         sentence_buf = ""
         try:
             async for token in llm_service.stream_response(transcript, conversation_history):
+                timer.mark("llm_first_token")  # first token = LLM "thinking" time
                 await _send_json(ws, {"type": "llm.token", "text": token})
                 sentence_buf += token
                 full_response_parts.append(token)
 
+                # A sentence is ready once it ends in punctuation and isn't
+                # trivially short (avoids sending "Dr." or "1." alone to TTS).
                 stripped = sentence_buf.strip()
-                if stripped and len(stripped) > 5 and stripped[-1] in _SENTENCE_ENDERS:
+                if len(stripped) > 5 and stripped[-1] in _SENTENCE_ENDERS:
+                    timer.mark("llm_first_sentence")  # first sentence handed to TTS
                     await sentence_queue.put(sentence_buf)
                     sentence_buf = ""
 
-            # Flush leftover text
-            if sentence_buf.strip():
+            if sentence_buf.strip():  # flush whatever is left
+                timer.mark("llm_first_sentence")  # (no-op if already marked)
                 await sentence_queue.put(sentence_buf)
 
         except Exception as exc:
             logger.error("LLM streaming error: %s", exc)
             await _send_json(ws, {"type": "error", "message": f"AI response failed: {exc}"})
         finally:
-            # Signal TTS that no more sentences are coming
-            await sentence_queue.put(None)
+            timer.mark("llm_done")
+            await sentence_queue.put(None)  # tell the consumer we're done
 
-            # Send full response to client
             full_text = "".join(full_response_parts)
             await _send_json(ws, {"type": "llm.done", "text": full_text})
 
-            # Update conversation history (in-memory, per session)
+            # Remember this turn so the LLM has context next time.
             if full_text:
-                conversation_history.append({"role": "user", "parts": [transcript]})
-                conversation_history.append({"role": "model", "parts": [full_text]})
+                conversation_history.append({"role": "user", "content": transcript})
+                conversation_history.append({"role": "assistant", "content": full_text})
 
-    # ── Task B: read sentences → TTS → stream audio to client ───────────
     async def _tts_to_client() -> None:
-        first_audio = True
-        chunk_count = 0
-        total_bytes = 0
+        """Consumer: sentences → TTS → binary audio frames to the client."""
 
         async def _sentence_gen():
-            """Async generator that drains the sentence queue."""
             while True:
                 sentence = await sentence_queue.get()
                 if sentence is None:
-                    logger.info("TTS sentence queue exhausted (None sentinel)")
                     break
-                logger.info("TTS sentence dequeued: %.80s", sentence.strip())
                 yield sentence
 
+        first_audio = True
         try:
             async for audio_chunk in tts_service.stream_tts(_sentence_gen()):
                 if first_audio:
-                    logger.info("First TTS audio chunk received (%d bytes)", len(audio_chunk))
+                    timer.mark("tts_first_audio")  # first playable audio bytes
+                    # Tell the client audio is coming and at what sample rate.
                     await _send_json(ws, {
                         "type": "tts.start",
                         "sampleRate": settings.SARVAM_TTS_SAMPLE_RATE,
                     })
                     first_audio = False
-                chunk_count += 1
-                total_bytes += len(audio_chunk)
                 await ws.send_bytes(audio_chunk)
-
-            logger.info("TTS streaming complete: %d chunks, %d bytes total", chunk_count, total_bytes)
 
         except Exception as exc:
             logger.error("TTS streaming error: %s", exc, exc_info=True)
             await _send_json(ws, {"type": "error", "message": f"Speech synthesis failed: {exc}"})
         finally:
-            if chunk_count == 0:
-                logger.warning("No audio chunks were produced by TTS")
+            timer.mark("tts_done")
             await _send_json(ws, {"type": "tts.done"})
 
-    # ── Run both tasks concurrently ──────────────────────────────────────
     await asyncio.gather(_llm_to_sentences(), _tts_to_client())
+    timer.summary(stt_ms)
 
 
-# ═════════════════════════════════════════════════════════════════════════
-#  WebSocket endpoint
-# ═════════════════════════════════════════════════════════════════════════
 @app.websocket("/ws/voice")
 async def voice_websocket(ws: WebSocket) -> None:
-    """
-    Handle a full-duplex voice conversation session.
-
-    Architecture (Hybrid VAD):
-      - Client-side Silero VAD detects speech start → instant barge-in
-      - Client streams raw PCM-16 audio continuously to this server
-      - Server forwards audio to Deepgram Nova-3 for transcription
-      - Deepgram's built-in endpointing detects end-of-turn
-      - utterance_end event triggers the LLM → TTS pipeline
-    """
+    """Handle one full-duplex voice conversation session."""
     await ws.accept()
     logger.info("Client connected")
 
-    # ── Per-session state ────────────────────────────────────────────────
+    # Per-session state. History lives in memory and dies with the connection.
     conversation_history: list[dict] = []
     pipeline_task: asyncio.Task | None = None
+    # perf_counter when the client's VAD first heard speech this turn — used
+    # to measure how long Deepgram takes to reach end-of-turn.
+    t_speech_start: float | None = None
 
-    # ── Per-session services ─────────────────────────────────────────────
+    # Each session gets its own upstream connections.
     session_tts = SarvamTTS()
     session_stt = DeepgramStreamingSTT()
 
-    # ── Deepgram callbacks (closures with access to session state) ────────
-
-    async def on_interim_transcript(text: str) -> None:
-        """Forward interim (partial) transcript to client for real-time display."""
-        await _send_json(ws, {"type": "stt.interim", "text": text})
-
-    async def on_final_transcript(text: str) -> None:
-        """Forward finalized transcript segment to client."""
-        await _send_json(ws, {"type": "stt.final", "text": text})
-
-    async def on_utterance_end(transcript: str) -> None:
-        """Deepgram detected end-of-turn — trigger the LLM → TTS pipeline."""
+    async def _cancel_pipeline(reconnect_tts: bool = True) -> None:
+        """Stop a running LLM→TTS pipeline and drop its queued TTS audio."""
         nonlocal pipeline_task
-
-        logger.info("Utterance complete → %s", transcript)
-
-        # Tell client we have the final result (client stops streaming audio)
-        await _send_json(ws, {"type": "stt.result", "text": transcript})
-
-        # Cancel any running pipeline (e.g. from a previous turn)
         if pipeline_task and not pipeline_task.done():
             pipeline_task.cancel()
             try:
                 await pipeline_task
             except (asyncio.CancelledError, Exception):
                 pass
-            # Reset TTS connection to drop any pending audio
+            # Reconnect TTS so audio from the cancelled turn is discarded.
+            # (Skipped during final cleanup — the socket is about to close.)
             await session_tts.close()
-            await session_tts.connect()
+            if reconnect_tts:
+                await session_tts.connect()
 
-        # Launch LLM → TTS pipeline
+    # ── Deepgram callbacks (closures over the session state above) ───────
+
+    async def on_interim(text: str) -> None:
+        """Partial transcript — shown live in the UI while the user speaks."""
+        await _send_json(ws, {"type": "stt.interim", "text": text})
+
+    async def on_final(text: str) -> None:
+        """A finalized transcript segment (the utterance may still continue)."""
+        await _send_json(ws, {"type": "stt.final", "text": text})
+
+    async def on_utterance_end(transcript: str) -> None:
+        """Deepgram decided the user finished speaking — run the pipeline."""
+        nonlocal pipeline_task, t_speech_start
+        logger.info("Utterance complete → %s", transcript)
+        await _send_json(ws, {"type": "stt.result", "text": transcript})
+
+        # How long Deepgram took from speech onset to end-of-turn (includes
+        # the user's speaking time plus the endpointing silence window).
+        stt_ms = (time.perf_counter() - t_speech_start) * 1000 if t_speech_start else None
+        t_speech_start = None
+        timer = TurnTimer()  # t0 = now (end-of-turn); pipeline latency starts here
+
+        await _cancel_pipeline()  # in case a previous turn is still speaking
         pipeline_task = asyncio.create_task(
-            run_voice_pipeline(ws, transcript, conversation_history, session_tts)
+            run_voice_pipeline(ws, transcript, conversation_history, session_tts, timer, stt_ms)
         )
 
-    # ── Main loop ────────────────────────────────────────────────────────
-    try:
-        # Connect TTS eagerly (it's used for every response)
-        await session_tts.connect()
-        # Connect STT eagerly since we stream continuously
+    async def _connect_stt() -> None:
         await session_stt.connect(
-            on_interim=on_interim_transcript,
-            on_final=on_final_transcript,
+            on_interim=on_interim,
+            on_final=on_final,
             on_utterance_end=on_utterance_end,
         )
-        logger.info("STT & TTS WebSockets ready — waiting for speech")
+
+    # ── Main receive loop ─────────────────────────────────────────────────
+    try:
+        # Both upstream sockets are opened eagerly: STT because audio streams
+        # continuously, TTS so the first response has no connection delay.
+        await session_tts.connect()
+        await _connect_stt()
+        logger.info("STT & TTS ready — waiting for speech")
 
         while True:
             message = await ws.receive()
 
-            # ── Connection closed ────────────────────────────────────
             if message["type"] == "websocket.disconnect":
                 break
 
-            # ── JSON control messages ────────────────────────────────
+            # JSON control messages from the client
             if "text" in message:
                 data = json.loads(message["text"])
                 msg_type = data.get("type", "")
 
                 if msg_type == "speech.start":
-                    # Client VAD detected speech — reset Deepgram transcript just in case
+                    # Client VAD heard speech — start the transcript fresh and
+                    # start the clock for this turn's end-to-end latency.
                     logger.info("Speech started (VAD)")
-                    if session_stt.ws is not None:
-                        session_stt.reset_transcript()
+                    t_speech_start = time.perf_counter()
+                    session_stt.reset_transcript()
 
                 elif msg_type == "interrupt":
-                    # Client VAD detected barge-in
-                    logger.info("Interrupt requested (barge-in)")
-                    if pipeline_task and not pipeline_task.done():
-                        pipeline_task.cancel()
-                        try:
-                            await pipeline_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                        # Reset TTS to drop pending audio from old pipeline
-                        await session_tts.close()
-                        await session_tts.connect()
-
-                    # Reset Deepgram for fresh session (drops old partial transcripts)
+                    # User spoke over the AI (barge-in): kill the pipeline and
+                    # reconnect Deepgram so stale partial transcripts are gone.
+                    logger.info("Interrupt (barge-in)")
+                    await _cancel_pipeline()
                     await session_stt.close()
-                    await session_stt.connect(
-                        on_interim=on_interim_transcript,
-                        on_final=on_final_transcript,
-                        on_utterance_end=on_utterance_end,
-                    )
+                    await _connect_stt()
                     await _send_json(ws, {"type": "interrupted"})
-
-                elif msg_type == "clear_history":
-                    conversation_history.clear()
-                    await _send_json(ws, {"type": "history_cleared"})
-                    logger.info("Conversation history cleared")
 
                 elif msg_type == "ping":
                     await _send_json(ws, {"type": "pong"})
 
-            # ── Binary audio frames → forward to Deepgram ────────────
+            # Binary frames are raw PCM-16 mic audio → forward to Deepgram.
             elif "bytes" in message:
-                # Log the very first chunk to confirm audio is arriving
-                if not hasattr(ws, "_audio_received"):
-                    logger.info("First client audio chunk received (%d bytes)", len(message["bytes"]))
-                    ws._audio_received = True
                 await session_stt.send_audio(message["bytes"])
 
     except WebSocketDisconnect:
@@ -291,37 +319,17 @@ async def voice_websocket(ws: WebSocket) -> None:
     except Exception as exc:
         logger.error("WebSocket error: %s", exc)
     finally:
-        if pipeline_task and not pipeline_task.done():
-            pipeline_task.cancel()
-            try:
-                await pipeline_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        await asyncio.gather(
-            session_stt.close(),
-            session_tts.close(),
-        )
+        await _cancel_pipeline(reconnect_tts=False)
+        await asyncio.gather(session_stt.close(), session_tts.close())
         logger.info("Connection cleaned up")
 
 
-# ═════════════════════════════════════════════════════════════════════════
-#  Health check
-# ═════════════════════════════════════════════════════════════════════════
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "service": "tts-speech-engine"}
 
 
-# ═════════════════════════════════════════════════════════════════════════
-#  Entrypoint
-# ═════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(
-        "main:app",
-        host=settings.HOST,
-        port=settings.PORT,
-        reload=True,
-        log_level="info",
-    )
+    uvicorn.run("main:app", host=settings.HOST, port=settings.PORT, reload=True)

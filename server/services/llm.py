@@ -1,27 +1,28 @@
 """
-Google Gemini Flash LLM service — async streaming.
+OpenRouter LLM service — async streaming via the OpenAI-compatible API.
 """
 
+import json
 import logging
 from typing import AsyncGenerator
 
-import google.generativeai as genai
+import httpx
 
 from config import settings
 
 logger = logging.getLogger(__name__)
 
 
-class GeminiLLM:
-    """Stream chat completions from Google Gemini Flash."""
+class OpenRouterLLM:
+    """Stream chat completions from OpenRouter (SSE)."""
 
     def __init__(self) -> None:
-        genai.configure(api_key=settings.GOOGLE_API_KEY)
-        self.model = genai.GenerativeModel(
-            settings.LLM_MODEL,
-            system_instruction=settings.LLM_SYSTEM_PROMPT,
+        self.client = httpx.AsyncClient(
+            base_url="https://openrouter.ai/api/v1",
+            headers={"Authorization": f"Bearer {settings.OPENROUTER_API_KEY}"},
+            timeout=httpx.Timeout(60.0, connect=10.0),
         )
-        logger.info("Gemini LLM initialised  model=%s", settings.LLM_MODEL)
+        logger.info("OpenRouter LLM initialised  model=%s", settings.OPENROUTER_MODEL)
 
     # ------------------------------------------------------------------ #
     async def stream_response(
@@ -37,22 +38,40 @@ class GeminiLLM:
         user_message : str
             The latest user utterance (from STT).
         conversation_history : list | None
-            Previous turns in ``[{"role": "user"|"model", "parts": ["…"]}]`` format.
+            Previous turns in OpenAI ``[{"role": "user"|"assistant", "content": "…"}]`` format.
 
         Yields
         ------
         str   Text token strings as they arrive.
         """
-        messages: list[dict] = list(conversation_history or [])
-        messages.append({"role": "user", "parts": [user_message]})
+        messages = [{"role": "system", "content": settings.LLM_SYSTEM_PROMPT}]
+        messages += conversation_history or []
+        messages.append({"role": "user", "content": user_message})
 
         logger.info("LLM prompt (%d turns) → %.100s…", len(messages), user_message)
 
-        response = await self.model.generate_content_async(
-            messages,
-            stream=True,
-        )
+        async with self.client.stream(
+            "POST",
+            "/chat/completions",
+            json={
+                "model": settings.OPENROUTER_MODEL,
+                "messages": messages,
+                "stream": True,
+            },
+        ) as response:
+            if response.status_code != 200:
+                body = (await response.aread()).decode(errors="replace")
+                raise RuntimeError(f"OpenRouter error {response.status_code}: {body[:500]}")
 
-        async for chunk in response:
-            if chunk.text:
-                yield chunk.text
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue  # skips OpenRouter ": PROCESSING" keep-alive comments
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                choices = json.loads(data).get("choices") or []
+                if not choices:
+                    continue  # final usage-only chunk
+                token = choices[0].get("delta", {}).get("content")
+                if token:
+                    yield token
