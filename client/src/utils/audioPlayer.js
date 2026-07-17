@@ -28,7 +28,9 @@ export class AudioPlayer {
     // Pre-buffering: accumulate a few chunks before starting playback
     // to absorb network jitter and prevent gaps
     this.pendingBuffers = [];
-    this.MIN_BUFFER_CHUNKS = 2; // Wait for 2 chunks before starting
+    // ~4 chunks ≈ 300-400ms of audio: enough cushion that brief network or
+    // synthesis stalls don't starve the scheduler (audible as jitter/gaps).
+    this.MIN_BUFFER_CHUNKS = 4;
     this.playbackStarted = false;
   }
 
@@ -42,6 +44,11 @@ export class AudioPlayer {
       // The resulting MediaStream is played through a hidden <audio> element,
       // which Chrome's AEC can properly track and subtract from the microphone.
       this._streamDestination = this.audioContext.createMediaStreamDestination();
+
+      // Analyser tap so the UI can read live output loudness (drives the orb).
+      this._analyser = this.audioContext.createAnalyser();
+      this._analyser.fftSize = 256;
+      this._analyserData = new Uint8Array(this._analyser.fftSize);
 
       // Start a continuous silent oscillator routed through the stream destination.
       // This keeps the MediaStream "alive" and prevents the OS audio hardware
@@ -80,9 +87,10 @@ export class AudioPlayer {
 
   /**
    * Convert PCM-16 ArrayBuffer to an AudioBuffer.
-   * Applies a micro-crossfade (fade-in/fade-out) at chunk boundaries
-   * to eliminate clicks caused by sample discontinuities between
-   * independently-encoded WAV chunks from the TTS service.
+   *
+   * Note: chunks are contiguous slices of ONE continuous PCM stream, so no
+   * fading/crossfading at chunk boundaries — fading every ~67ms chunk in and
+   * out creates a 15Hz volume warble that sounds like a bad phone line.
    *
    * @param {ArrayBuffer} pcm16Buf  Raw signed-16-bit little-endian mono.
    * @returns {AudioBuffer}
@@ -92,15 +100,6 @@ export class AudioPlayer {
     const float32 = new Float32Array(int16.length);
     for (let i = 0; i < int16.length; i++) {
       float32[i] = int16[i] / 32768.0;
-    }
-
-    // Micro-crossfade: 32 samples ≈ 1.3ms at 24kHz.
-    // Short enough to be inaudible, long enough to smooth discontinuities.
-    const fadeLen = Math.min(32, float32.length);
-    for (let i = 0; i < fadeLen; i++) {
-      const gain = i / fadeLen;
-      float32[i] *= gain;                           // fade in
-      float32[float32.length - 1 - i] *= gain;      // fade out
     }
 
     const buffer = this.audioContext.createBuffer(
@@ -124,6 +123,7 @@ export class AudioPlayer {
 
     // Route to the MediaStream destination (AEC bridge), not the raw speaker output.
     source.connect(this._streamDestination);
+    source.connect(this._analyser); // parallel tap for level metering
     this.sources.push(source);
 
     // Schedule: if we've fallen behind, jump to now + look-ahead
@@ -215,6 +215,18 @@ export class AudioPlayer {
     this.isPlaying = false;
     this.pendingBuffers = [];
     this.playbackStarted = false;
+  }
+
+  /** Current output loudness as an RMS level in ~0..1 (0 when silent/idle). */
+  getLevel() {
+    if (!this._analyser || !this.isPlaying) return 0;
+    this._analyser.getByteTimeDomainData(this._analyserData);
+    let sum = 0;
+    for (let i = 0; i < this._analyserData.length; i++) {
+      const v = (this._analyserData[i] - 128) / 128; // center & normalize
+      sum += v * v;
+    }
+    return Math.sqrt(sum / this._analyserData.length);
   }
 
   /** True while queued audio is still playing. */

@@ -31,7 +31,7 @@ function App() {
 
   return (
     <div className="app">
-      <VoiceChat />
+      <VoiceChat onEnd={() => setLaunched(false)} />
     </div>
   );
 }
