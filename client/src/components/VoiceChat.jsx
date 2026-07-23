@@ -41,6 +41,7 @@ export default function VoiceChat({ onEnd }) {
   // ── State ──────────────────────────────────────────────────────────
   const [status, setStatus] = useState("idle"); // idle|listening|recording|processing|speaking
   const [interimTranscript, setInterimTranscript] = useState("");
+  const [responseCaption, setResponseCaption] = useState(""); // live AI answer, captioned as it's spoken
   const [isConnected, setIsConnected] = useState(false);
 
   // ── Refs (survive re-renders, avoid stale closures) ────────────────
@@ -108,6 +109,7 @@ export default function VoiceChat({ onEnd }) {
     setStatus("listening");
 
     setInterimTranscript("");
+    setResponseCaption("");
   }, []);
 
   // ── WebSocket message handler ──────────────────────────────────────
@@ -142,6 +144,7 @@ export default function VoiceChat({ onEnd }) {
       // ── LLM events ────────────────────────────────────────────
       case "llm.token":
         currentResponseRef.current += data.text;
+        setResponseCaption(currentResponseRef.current);
         break;
 
       case "llm.done":
@@ -196,6 +199,7 @@ export default function VoiceChat({ onEnd }) {
         currentResponseRef.current = "";
         llmDoneTextRef.current = "";
         setInterimTranscript("");
+        setResponseCaption("");
         // Don't resume listening — the barge-in speech is still active
         break;
 
@@ -402,8 +406,12 @@ export default function VoiceChat({ onEnd }) {
 
       <div className="stage-label">{STATUS_LABEL[status] || STATUS_LABEL.idle}</div>
 
-      {/* Interim transcription — the only text on screen, as a caption bubble */}
-      {interimTranscript && <div className="caption">{interimTranscript}</div>}
+      {/* Caption bubble — your live interim transcript while you talk,
+          or the AI's answer captioned live as it's generated/spoken.
+          The two never overlap: one clears before the other starts. */}
+      {(interimTranscript || responseCaption) && (
+        <div className="caption">{interimTranscript || responseCaption}</div>
+      )}
 
       {/* Hidden <audio> element for AEC (Acoustic Echo Cancellation). */}
       <audio ref={audioElRef} autoPlay style={{ display: "none" }} />
